@@ -878,11 +878,37 @@ TPU_TYPES = {
 }
 
 
+from cpu_data import (
+    CPU_MACHINE_TYPES,
+    CPU_SERIES,
+    compute_pool_chunk_bounds,
+    get_cpu_candidate_shapes,
+    get_cpu_regions_for_series,
+    get_cpu_zones_for_series,
+    normalize_cpu_series,
+)
+
+
+def is_cpu_machine_type(machine_type: str) -> bool:
+    """Return True if machine_type is a known GCE CPU machine shape."""
+    return machine_type in CPU_MACHINE_TYPES
+
+
+def get_gce_machine_info(machine_type: str) -> dict | None:
+    """Return GCE VM metadata for either a GPU or CPU machine type."""
+    if machine_type in MACHINE_TYPES:
+        return MACHINE_TYPES[machine_type]
+    return CPU_MACHINE_TYPES.get(machine_type)
+
+
 def get_zones_for_machine_type(machine_type: str) -> list[str]:
-    """Get supported zones for a given machine type (GPU or TPU)."""
+    """Get supported zones for a given machine type (GPU, TPU, or CPU)."""
     for _tpu_type, tpu_info in TPU_TYPES.items():
         if machine_type in tpu_info.get("machine_types", {}):
             return tpu_info["zones"]
+    if machine_type in CPU_MACHINE_TYPES:
+        series = CPU_MACHINE_TYPES[machine_type]["chip"]
+        return list(CPU_SERIES.get(series, {}).get("zones", []))
     family = MACHINE_TO_FAMILY.get(machine_type)
     if not family:
         return []
@@ -968,6 +994,9 @@ def is_consumption_supported(machine_type: str, consumption_model: str) -> bool:
     for _tpu_type, tpu_info in TPU_TYPES.items():
         if machine_type in tpu_info.get("machine_types", {}):
             return tpu_info.get("supported", {}).get(consumption_model, False)
+    if machine_type in CPU_MACHINE_TYPES:
+        series = CPU_MACHINE_TYPES[machine_type]["chip"]
+        return CPU_SERIES.get(series, {}).get("supported", {}).get(consumption_model, False)
     family = MACHINE_TO_FAMILY.get(machine_type)
     if not family:
         return False
@@ -1023,11 +1052,33 @@ def get_all_machine_types_info() -> list[dict]:
                 "topologies": tpu_info.get("topologies", []),
                 "supported": supported,
             })
+    for series_key, sinfo in CPU_SERIES.items():
+        zones = sinfo["zones"]
+        regions = sorted(set(z.rsplit("-", 1)[0] for z in zones))
+        supported = sinfo["supported"]
+        for mt_name, spec in sinfo["shapes"].items():
+            result.append({
+                "machineType": mt_name,
+                "gpu": sinfo["processor"],
+                "processor": sinfo["processor"],
+                "chip": series_key,
+                "gpuCount": 0,
+                "vcpus": spec["vcpus"],
+                "memoryGb": spec["memory_gb"],
+                "shapeClass": spec["shape_class"],
+                "architecture": sinfo["architecture"],
+                "family": series_key,
+                "category": "CPU",
+                "zones": zones,
+                "calendarZones": [],
+                "regions": regions,
+                "supported": dict(supported),
+            })
     return result
 
 
 def get_chip_groups() -> dict:
-    """Return machine types grouped by chip for the multi-step selector."""
+    """Return machine types grouped by chip/series for the multi-step selector."""
     gpu_chips = {}
     for mt, info in MACHINE_TYPES.items():
         chip = info.get("chip", info["gpu"])
@@ -1062,7 +1113,32 @@ def get_chip_groups() -> dict:
             "regions": sorted(set(z.rsplit("-", 1)[0] for z in tpu_info["zones"])),
         }
 
+    cpu_chips = []
+    for series_key, sinfo in CPU_SERIES.items():
+        zones = sinfo["zones"]
+        regions = sorted(set(z.rsplit("-", 1)[0] for z in zones))
+        cpu_chips.append({
+            "chip": series_key,
+            "gpu": sinfo["processor"],
+            "processor": sinfo["processor"],
+            "architecture": sinfo["architecture"],
+            "category": "CPU",
+            "zones": zones,
+            "regions": regions,
+            "supported": dict(sinfo["supported"]),
+            "machineTypes": [
+                {
+                    "machineType": mt_name,
+                    "vcpus": spec["vcpus"],
+                    "memoryGb": spec["memory_gb"],
+                    "shapeClass": spec["shape_class"],
+                }
+                for mt_name, spec in sinfo["shapes"].items()
+            ],
+        })
+
     return {
         "gpuChips": list(gpu_chips.values()),
         "tpuChips": list(tpu_chips.values()),
+        "cpuChips": cpu_chips,
     }

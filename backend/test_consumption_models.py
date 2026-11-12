@@ -500,7 +500,7 @@ class TestCapacityRadarEndToEnd(unittest.IsolatedAsyncioTestCase):
         for item in all_info:
             by_family.setdefault(item["family"], item)
 
-        self.assertEqual(len(by_family), 20)  # 13 GPU families + 7 TPU families
+        self.assertEqual(len(by_family), 37)  # 13 GPU families + 7 TPU families + 17 CPU series
 
         mock_client = AsyncMock()
         mock_client.post.return_value = MockResponse(200, {"name": "op-1", "done": True, "recommendations": []})
@@ -672,6 +672,369 @@ class TestCapacityRadarEndToEnd(unittest.IsolatedAsyncioTestCase):
                     self.assertIn("start", received_types)
                     self.assertIn("attempt", received_types)
                     self.assertIn("success", received_types)
+
+    async def test_11_cpu_catalog_arm64_hyperdisk_and_exact_shape(self):
+        """Verify CPU catalog (17 series), ARM64 debian-12-arm64 boot image, Hyperdisk/gVNIC, and exact-shape deploy."""
+        from cpu_data import ARM64_BOOT_IMAGE, CPU_MACHINE_TYPES, CPU_SERIES, X86_64_BOOT_IMAGE
+
+        self.assertEqual(len(CPU_SERIES), 17)
+        self.assertIn("c4a-highcpu-64", CPU_MACHINE_TYPES)
+        c4a_64 = CPU_MACHINE_TYPES["c4a-highcpu-64"]
+        self.assertEqual(c4a_64["vcpus"], 64)
+        self.assertEqual(c4a_64["memory_gb"], 128)
+        self.assertEqual(c4a_64["architecture"], "ARM64")
+        self.assertEqual(c4a_64["boot_image"], ARM64_BOOT_IMAGE)
+        self.assertTrue(c4a_64["requires_hyperdisk"])
+        self.assertTrue(c4a_64["requires_gvnic"])
+
+        # Verify ARM64 vs X86_64 boot images across all CPU machine types
+        arm_series = {"C4A", "N4A", "T2A"}
+        hyperdisk_cpu_series = {"C4A", "C4", "C4D", "N4", "N4A", "N4D", "H4D"}
+        for mt, info in CPU_MACHINE_TYPES.items():
+            series = info["chip"]
+            if series in arm_series:
+                self.assertEqual(info["boot_image"], ARM64_BOOT_IMAGE, f"{mt} must boot ARM64 image")
+            else:
+                self.assertEqual(info["boot_image"], X86_64_BOOT_IMAGE, f"{mt} must boot X86_64 image")
+            if series in hyperdisk_cpu_series:
+                self.assertTrue(info["requires_hyperdisk"], f"{mt} must require hyperdisk")
+                self.assertEqual(info["default_boot_disk_type"], "hyperdisk-balanced")
+
+        # Verify _build_gpu_instance_body produces ARM64 image + hyperdisk-balanced + GVNIC + no guestAccelerators for c4a-highcpu-64
+        async def noop(_msg):
+            pass
+
+        session = hunter.ScanningSession(
+            session_id="c4aexact",
+            project="test-proj",
+            machine_type="c4a-highcpu-64",
+            vm_count=2,
+            priorities=[],
+            send_update=noop,
+            user_token="tok",
+            network="default",
+        )
+        body = session._build_gpu_instance_body(
+            inst_name="cpu-radar-spot-test",
+            zone="us-central1-a",
+            network="projects/test-proj/global/networks/default",
+            subnetwork="projects/test-proj/regions/us-central1/subnetworks/default",
+            provisioning_model="SPOT",
+            label_method="spot",
+        )
+        self.assertEqual(body["disks"][0]["initializeParams"]["sourceImage"], ARM64_BOOT_IMAGE)
+        self.assertIn("hyperdisk-balanced", body["disks"][0]["initializeParams"]["diskType"])
+        self.assertEqual(body["networkInterfaces"][0]["nicType"], "GVNIC")
+        self.assertNotIn("guestAccelerators", body)
+
+    async def test_12_cpu_pool_multi_region_with_min_cluster_30(self):
+        """Verify 500 C4A vCPU multi_region pool hunting enforces min_cluster_vcpus=30 and tail-remainder floor."""
+        from cpu_data import compute_pool_chunk_bounds
+
+        # Tail remainder math check: if 480/500 vCPUs already secured (remaining=20) with min_cluster=30 and 16-vCPU shape:
+        # Must request at least ceil(30/16)=2 VMs (32 vCPUs >= 30), NEVER 1 VM (16 < 30)!
+        min_vms, max_vms = compute_pool_chunk_bounds(
+            remaining_vcpus=20, min_cluster_vcpus=30, shape_vcpus=16, placement_scope="multi_region"
+        )
+        self.assertEqual(min_vms, 2)
+        self.assertEqual(max_vms, 2)
+
+        # Simulate Spot bulkInsert across 4 zones where partial capacities exist:
+        # - us-central1-a: gives 4x c4a-highcpu-64 = 256 vCPUs
+        # - europe-west4-a: stockout (400/stockout) -> 0 vCPUs
+        # - asia-east1-a: gives 3x c4a-highcpu-64 = 192 vCPUs (total so far = 448, remaining = 52)
+        # - us-east4-a: 64-vCPU stocks out, steps down to c4a-highcpu-48 or 32 -> gives 2x c4a-highcpu-32 = 64 vCPUs -> total = 512 >= 500!
+        bulk_calls = []
+
+        async def mock_post(url, json=None, headers=None):
+            bulk_calls.append((url, json))
+            mt = json["instanceProperties"]["machineType"]
+            if "/zones/us-central1-a/instances/bulkInsert" in url and mt == "c4a-highcpu-64":
+                return MockResponse(200, {
+                    "name": "op-uc1a",
+                    "status": "DONE",
+                    "instancesBulkInsertOperationMetadata": {
+                        "perLocationStatus": {"zones/us-central1-a": {"status": "DONE", "createdVmCount": 4}}
+                    },
+                })
+            if "/zones/asia-east1-a/instances/bulkInsert" in url and mt == "c4a-highcpu-64":
+                return MockResponse(200, {
+                    "name": "op-ae1a",
+                    "status": "DONE",
+                    "instancesBulkInsertOperationMetadata": {
+                        "perLocationStatus": {"zones/asia-east1-a": {"status": "DONE", "createdVmCount": 3}}
+                    },
+                })
+            if "/zones/us-east4-a/instances/bulkInsert" in url and mt == "c4a-highcpu-32":
+                return MockResponse(200, {
+                    "name": "op-ue4a",
+                    "status": "DONE",
+                    "instancesBulkInsertOperationMetadata": {
+                        "perLocationStatus": {"zones/us-east4-a": {"status": "DONE", "createdVmCount": 2}}
+                    },
+                })
+            return MockResponse(409, {"error": {"code": 409, "message": "The zone does not have enough resources available"}})
+
+        mock_client = AsyncMock()
+        mock_client.post.side_effect = mock_post
+        mock_client.get.return_value = MockResponse(200, {"items": [{"name": "default"}]})
+        mock_client.__aenter__.return_value = mock_client
+        mock_client.__aexit__.return_value = None
+
+        updates = []
+        async def record_update(msg):
+            updates.append(msg)
+
+        session = hunter.ScanningSession(
+            session_id="pool500mr",
+            project="test-proj",
+            machine_type="",
+            vm_count=1,
+            sizing_mode="vcpu_pool",
+            cpu_family="C4a",  # mixed-case input should normalize to C4A
+            target_vcpus=500,
+            placement_scope="multi_region",
+            min_cluster_vcpus=30,
+            shape_class="highcpu",
+            priorities=[{
+                "method": "spot",
+                "zones": ["us-central1-a", "europe-west4-a", "asia-east1-a", "us-east4-a"],
+                "max_retries": 1,
+                "retry_interval": 10,
+            }],
+            send_update=record_update,
+            user_token="fake-token",
+            network="default",
+        )
+
+        with patch("httpx.AsyncClient", return_value=mock_client), \
+             patch.object(hunter.ScanningSession, "_log_deployment_event", MagicMock()):
+            await session.run(parallel=False)
+
+        self.assertEqual(session.status, hunter.ScanningStatus.SUCCESS)
+        self.assertIsNotNone(session.result)
+        self.assertEqual(session.result["cpu_family"], "C4A")
+        self.assertGreaterEqual(session.result["total_vcpus"], 500)
+        self.assertEqual(len(session.result["shards"]), 3)
+        for sh in session.result["shards"]:
+            self.assertGreaterEqual(sh["vcpus"], 30, f"Shard {sh} violated min_cluster_vcpus=30")
+        # Verify bulkInsert payload probed top shape c4a-highcpu-72 first, then stepped down to c4a-highcpu-64 with bare diskType + ARM64 boot image
+        _, first_payload = bulk_calls[0]
+        _, second_payload = bulk_calls[1]
+        self.assertEqual(first_payload["instanceProperties"]["machineType"], "c4a-highcpu-72")
+        self.assertEqual(second_payload["instanceProperties"]["machineType"], "c4a-highcpu-64")
+        self.assertEqual(second_payload["instanceProperties"]["disks"][0]["initializeParams"]["diskType"], "hyperdisk-balanced")
+        self.assertIn("debian-12-arm64", second_payload["instanceProperties"]["disks"][0]["initializeParams"]["sourceImage"])
+
+    async def test_13_cpu_pool_single_region_rollback_and_fulfillment(self):
+        """Verify single_region pool rolls back incomplete region shards before fulfilling all 500 vCPUs in next region."""
+        deleted_urls = []
+
+        async def mock_post(url, json=None, headers=None):
+            count = int(json["specificReservation"]["count"])
+            mt = json["specificReservation"]["instanceProperties"]["machineType"]
+            # Region 1 (asia-east1 has 3 zones): asia-east1-a only has 3x c4a-standard-64 (192 vCPUs), b & c stock out!
+            if "/zones/asia-east1-a/reservations" in url and mt == "c4a-standard-64" and count <= 3:
+                return MockResponse(200, {"name": "op-ae1a", "status": "DONE"})
+            # Region 2 (us-central1 has 3 zones passed): us-central1-a gives 4x 64 (256) and us-central1-b gives 4x 64 (256) = 512 vCPUs!
+            if "/zones/us-central1-a/reservations" in url and mt == "c4a-standard-64" and count <= 4:
+                return MockResponse(200, {"name": "op-uc1a", "status": "DONE"})
+            if "/zones/us-central1-b/reservations" in url and mt == "c4a-standard-64" and count <= 4:
+                return MockResponse(200, {"name": "op-uc1b", "status": "DONE"})
+            return MockResponse(409, {"error": {"code": 409, "message": "The zone does not have enough resources available"}})
+
+        async def mock_delete(url, headers=None):
+            deleted_urls.append(url)
+            return MockResponse(200, {"status": "DONE"})
+
+        mock_client = AsyncMock()
+        mock_client.post.side_effect = mock_post
+        mock_client.delete.side_effect = mock_delete
+        mock_client.__aenter__.return_value = mock_client
+        mock_client.__aexit__.return_value = None
+
+        updates = []
+        async def record_update(msg):
+            updates.append(msg)
+
+        session = hunter.ScanningSession(
+            session_id="pool500sr",
+            project="test-proj",
+            machine_type="",
+            vm_count=1,
+            sizing_mode="vcpu_pool",
+            cpu_family="C4A",
+            target_vcpus=500,
+            placement_scope="single_region",
+            min_cluster_vcpus=30,
+            shape_class="standard",
+            priorities=[{
+                "method": "on_demand",
+                "zones": [
+                    "asia-east1-a", "asia-east1-b", "asia-east1-c",
+                    "us-central1-a", "us-central1-b", "us-central1-c",
+                ],
+                "max_retries": 1,
+                "retry_interval": 10,
+            }],
+            send_update=record_update,
+            user_token="fake-token",
+            network="default",
+        )
+
+        with patch("httpx.AsyncClient", return_value=mock_client), \
+             patch.object(hunter.ScanningSession, "_log_deployment_event", MagicMock()):
+            await session.run(parallel=False)
+
+        self.assertEqual(session.status, hunter.ScanningStatus.SUCCESS)
+        # Verify partial reservation in asia-east1-a was rolled back automatically!
+        self.assertEqual(len(deleted_urls), 1)
+        self.assertIn("/zones/asia-east1-a/reservations/", deleted_urls[0])
+        # Verify final result is 100% inside us-central1!
+        self.assertEqual(session.result["regions"], ["us-central1"])
+        self.assertEqual(session.result["total_vcpus"], 512)
+
+    async def test_14_cpu_pool_single_zone_ladder_stepdown(self):
+        """Verify single_zone mode steps down shape ladder (64 -> 48 -> 32) to fulfill 500 vCPUs in a single zone."""
+        async def mock_post(url, json=None, headers=None):
+            mt = json["specificReservation"]["instanceProperties"]["machineType"]
+            # 64 and 48 vCPU shapes are stocked out due to host fragmentation, but 16x c4a-highcpu-32 (512 vCPUs) fits!
+            if "/zones/us-east4-b/reservations" in url and mt == "c4a-highcpu-32":
+                return MockResponse(200, {"name": "op-ue4b", "status": "DONE"})
+            return MockResponse(409, {"error": {"code": 409, "message": "The zone does not have enough resources available"}})
+
+        mock_client = AsyncMock()
+        mock_client.post.side_effect = mock_post
+        mock_client.__aenter__.return_value = mock_client
+        mock_client.__aexit__.return_value = None
+
+        async def noop(_msg):
+            pass
+
+        session = hunter.ScanningSession(
+            session_id="pool500sz",
+            project="test-proj",
+            machine_type="",
+            vm_count=1,
+            sizing_mode="vcpu_pool",
+            cpu_family="C4A",
+            target_vcpus=500,
+            placement_scope="single_zone",
+            min_cluster_vcpus=500,
+            shape_class="highcpu",
+            priorities=[{
+                "method": "on_demand",
+                "zones": ["us-east4-b"],
+                "max_retries": 1,
+                "retry_interval": 10,
+            }],
+            send_update=noop,
+            user_token="fake-token",
+            network="default",
+        )
+
+        with patch("httpx.AsyncClient", return_value=mock_client), \
+             patch.object(hunter.ScanningSession, "_log_deployment_event", MagicMock()):
+            await session.run(parallel=False)
+
+        self.assertEqual(session.status, hunter.ScanningStatus.SUCCESS)
+        self.assertEqual(session.result["zones"], ["us-east4-b"])
+        self.assertEqual(session.result["shards"][0]["machine_type"], "c4a-highcpu-32")
+        self.assertEqual(session.result["shards"][0]["vm_count"], 16)
+        self.assertEqual(session.result["total_vcpus"], 512)
+
+    async def test_15_cpu_fastapi_endpoints_advisory_and_ws_pool(self):
+        """Verify /api/cpu-families, /api/advisory/cpu-pool, and WebSocket /ws/scan vcpu_pool mode."""
+        from fastapi.testclient import TestClient
+        import main as app_main
+
+        mock_http = AsyncMock()
+        mock_http.post.return_value = MockResponse(200, {
+            "name": "op-pool-ws",
+            "status": "DONE",
+            "recommendations": [
+                {
+                    "scores": {"obtainability": 0.92, "uptimeScore": 0.88},
+                    "shards": [{"zone": "zones/us-central1-a", "machineType": "c4a-standard-64", "instanceCount": 8}],
+                }
+            ],
+        })
+        mock_http.get.return_value = MockResponse(200, {"status": "DONE", "items": [{"name": "default"}]})
+        mock_http.__aenter__.return_value = mock_http
+        mock_http.__aexit__.return_value = None
+
+        with TestClient(app_main.app) as client:
+            # 1. /api/cpu-families
+            r = client.get("/api/cpu-families")
+            self.assertEqual(r.status_code, 200)
+            fams = r.json()["cpuFamilies"]
+            self.assertEqual(len(fams), 17)
+            c4a = next((f for f in fams if f["series"] == "C4A"), None)
+            self.assertIsNotNone(c4a)
+            self.assertEqual(len(c4a["zones"]), 77)
+
+            # 2. /api/chip-groups includes cpuChips
+            cg = client.get("/api/chip-groups").json()
+            self.assertIn("cpuChips", cg)
+            self.assertEqual(len(cg["cpuChips"]), 17)
+
+            with patch("httpx.AsyncClient", return_value=mock_http), \
+                 patch.object(hunter.ScanningSession, "_log_deployment_event", MagicMock()):
+                # 3. POST /api/advisory/cpu-pool
+                adv_resp = client.post(
+                    "/api/advisory/cpu-pool",
+                    headers={"Authorization": "Bearer fake-token"},
+                    json={
+                        "project": "test-proj",
+                        "cpuFamily": "C4A",
+                        "targetVcpus": 500,
+                        "placementScope": "multi_region",
+                        "minClusterVcpus": 30,
+                        "shapeClass": "highcpu",
+                        "regions": ["us-central1", "europe-west4"],
+                    },
+                )
+                self.assertEqual(adv_resp.status_code, 200)
+                adv_data = adv_resp.json()
+                self.assertEqual(adv_data["cpuFamily"], "C4A")
+                self.assertGreaterEqual(adv_data["totalPlannedVcpus"], 500)
+                for p in adv_data["proposedPlan"]:
+                    self.assertGreaterEqual(p["vcpus"], 30)
+
+                # 4. WebSocket /ws/scan in vcpu_pool mode
+                with client.websocket_connect("/ws/scan") as ws:
+                    ws.send_json({
+                        "action": "scan",
+                        "userToken": "fake-token",
+                        "config": {
+                            "project": "test-proj",
+                            "sizingMode": "vcpu_pool",
+                            "cpuFamily": "C4a",
+                            "targetVcpus": 500,
+                            "placementScope": "multi_region",
+                            "minClusterVcpus": 30,
+                            "shapeClass": "highcpu",
+                            "priorities": [
+                                {
+                                    "method": "on_demand",
+                                    "zones": ["us-central1-a"],
+                                    "max_retries": 1,
+                                    "retry_interval": 10,
+                                }
+                            ],
+                            "network": "default",
+                        },
+                    })
+                    final_msg = None
+                    for _ in range(25):
+                        msg = ws.receive_json()
+                        if msg.get("type") in ("success", "failed", "error"):
+                            final_msg = msg
+                            break
+                    self.assertIsNotNone(final_msg)
+                    self.assertEqual(final_msg["type"], "success")
+                    self.assertEqual(final_msg["data"]["result"]["sizing_mode"], "vcpu_pool")
+                    self.assertGreaterEqual(final_msg["data"]["result"]["total_vcpus"], 500)
 
 
 if __name__ == "__main__":

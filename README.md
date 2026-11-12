@@ -1,8 +1,8 @@
 # Capacity Radar
 
-**Priority-based GPU/TPU capacity scanning and deployment tool for Google Cloud Platform.**
+**Priority-based GPU, TPU, and CPU capacity scanning and deployment tool for Google Cloud Platform.**
 
-Capacity Radar automates finding and securing GPU/TPU capacity across Google Cloud zones. It supports multiple consumption models — On-Demand Reservations, DWS Calendar, DWS Flex Start, and Spot VMs — and lets you define a priority-based strategy that tries each method in order until capacity is secured.
+Capacity Radar automates finding and securing GPU, TPU, and CPU capacity across Google Cloud regions and zones. It supports multiple consumption models — On-Demand Reservations, DWS Calendar, DWS Flex Start, and Spot VMs — and supports both **exact VM shape hunting** (e.g., `a3-highgpu-8g`, `ct6e-standard-4t`, `c4a-highcpu-64`) and **flexible CPU vCPU pool hunting** (e.g., *"grab 500 C4A vCPUs anywhere, or within one region, or spread across regions with a minimum local cluster size of 30 vCPUs"*).
 
 ![Google Cloud](https://img.shields.io/badge/Google%20Cloud-GPU%20%2F%20TPU-4285F4?logo=google-cloud&logoColor=white)
 ![Python](https://img.shields.io/badge/Python-3.10+-3776AB?logo=python&logoColor=white)
@@ -60,12 +60,33 @@ Capacity Radar automates finding and securing GPU/TPU capacity across Google Clo
 
 | Type | Zones | DWS Calendar | Spot |
 |------|-------|:------------:|:----:|
-| v6e (Trillium) | 7 zones | Yes | Yes |
+| v7x (Ironwood) | 9 zones | - | Yes |
+| v6e (Trillium) | 11 zones | Yes | Yes |
 | v5p | 3 zones | Yes | Yes |
 | v5e | 5 zones | Yes | Yes |
 | v4 | 1 zone | - | Yes |
 | v3 | 3 zones | - | Yes |
 | v2 | 5 zones | - | Yes |
+
+**CPU Series (Exact Shape + Flexible vCPU Pool Hunting):**
+
+| Series | Processor / Architecture | Shapes | Zones | On-Demand | Spot | DWS Flex Start |
+|--------|--------------------------|--------|:-----:|:---------:|:----:|:--------------:|
+| **C4A** | Google Axion (ARM64) | `c4a-{standard,highcpu,highmem}-{1..72}` | 77 | Yes | Yes | Yes (Preview) |
+| **C4** | Intel Granite / Emerald Rapids | `c4-{standard,highcpu,highmem}-{2..288}` | 116 | Yes | Yes | Yes (Preview) |
+| **C4D** | AMD EPYC Turin | `c4d-{standard,highcpu,highmem}-{2..384}` | 48 | Yes | Yes | Yes (Preview) |
+| **C3 / C3D** | Intel Sapphire Rapids / AMD Genoa | `c3-*`, `c3d-*` | 85 / 56 | Yes | Yes | C3 (Preview) |
+| **N4 / N4A / N4D** | Emerald Rapids / Axion / Turin | `n4-*`, `n4a-*`, `n4d-*` | 118 / 28 / 35 | Yes | Yes | N4 (Preview) |
+| **H4D / H3** | HPC AMD Turin / Sapphire Rapids | `h4d-*-192`, `h3-standard-88` | 8 / 4 | Yes | Yes | - |
+| **N2 / N2D / T2A / T2D / C2 / C2D / E2** | Scale-out & General-Purpose | Standard, High-CPU, High-Mem | Up to 127 | Yes | Yes | - |
+
+### Flexible CPU vCPU Pool Modes
+
+When **Resource Type = CPU** and **Broad vCPU Pool** mode is selected, Capacity Radar decomposes a target vCPU pool (e.g., `500` C4A vCPUs) across a high-density shape ladder (`64 -> 48 -> 32 -> 16 -> 8 -> 4` vCPUs) under three placement scopes:
+
+- **Multi-Region / Multi-Zone Spread (`multi_region`)** — Hunts across all allowed regions/zones and accumulates shards wherever capacity exists, strictly enforcing a configurable **Minimum Local Cluster Size** (e.g., `>= 30` vCPUs per zone via GCE `bulkInsert` `minCount` and reservation step floors).
+- **Same Region (`single_region`)** — Requires all target vCPUs to land inside a single region (any candidate region or a specific region), automatically rolling back partial shards if a candidate region cannot satisfy the pool minimum before advancing to the next region.
+- **Same Zone (`single_zone`)** — Co-locates the entire vCPU pool within a single zone.
 
 ---
 

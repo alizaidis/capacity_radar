@@ -669,7 +669,7 @@ async def _query_spot_advisory_region(
     Endpoint: POST .../regions/{region}/advice/capacity
     """
     import httpx
-    from gpu_data import MACHINE_TYPES
+    from gpu_data import get_gce_machine_info
 
     url = (
         f"https://compute.googleapis.com/compute/alpha/projects/{project}"
@@ -687,8 +687,8 @@ async def _query_spot_advisory_region(
         }
     }
     # IMPORTANT: Only attach guestAccelerators for true guest-attached GPU families (N1 / T4).
-    # Built-in GPU families (G2, G4, A2, A3, A4, A4X) fail validation if guestAccelerators is set.
-    machine_info = MACHINE_TYPES.get(machine_type, {})
+    # Built-in GPU families (G2, G4, A2, A3, A4, A4X) and CPU families fail validation if guestAccelerators is set.
+    machine_info = get_gce_machine_info(machine_type) or {}
     if machine_info.get("guest_attached_gpu") and machine_info.get("accelerator_type"):
         gpu_count = machine_info.get("gpu_count", 1)
         instance_props["guestAccelerators"] = [{
@@ -865,7 +865,8 @@ async def get_flex_advisory(
     if not is_consumption_supported(machine_type, "dws_flex"):
         results["message"] = (
             f"DWS Flex Start is not supported for {machine_type}. "
-            "Supported GPU families for Flex Start: A4X Max, A4X, A4, A3 (Ultra/Mega/High/Edge), G4, G2, and N1."
+            "Supported families for Flex Start: GPU (A4X Max, A4X, A4, A3, G4, G2, N1) "
+            "and CPU (C4A, C4, C4D, C3, N4)."
         )
         return results
 
@@ -911,7 +912,7 @@ async def _query_flex_advisory_region(
     Endpoint: POST .../compute/alpha/projects/{project}/regions/{region}/advice/capacity
     """
     import httpx
-    from gpu_data import MACHINE_TYPES
+    from gpu_data import get_gce_machine_info
 
     url = (
         f"https://compute.googleapis.com/compute/alpha/projects/{project}"
@@ -930,7 +931,7 @@ async def _query_flex_advisory_region(
         }
     }
     # IMPORTANT: Only attach guestAccelerators for true guest-attached GPU families (N1 / T4).
-    machine_info = MACHINE_TYPES.get(machine_type, {})
+    machine_info = get_gce_machine_info(machine_type) or {}
     if machine_info.get("guest_attached_gpu") and machine_info.get("accelerator_type"):
         gpu_count = machine_info.get("gpu_count", 1)
         instance_props["guestAccelerators"] = [{
@@ -1033,3 +1034,218 @@ async def _query_flex_advisory_region(
         raise RuntimeError(f"Connection error querying flex advisory for {region}")
 
     return recommendations
+
+
+# --- CPU Broad vCPU Pool Capacity Planner -----------------------------------
+
+async def get_cpu_pool_advisory(
+    project: str,
+    cpu_family: str,
+    target_vcpus: int = 500,
+    placement_scope: str = "multi_region",
+    min_cluster_vcpus: int = 30,
+    shape_class: str = "any",
+    regions: list[str] | None = None,
+    zones: list[str] | None = None,
+    user_token: str | None = None,
+) -> dict:
+    """Query GCE Capacity Advisory across regions for a CPU series and build an optimal vCPU pool shard plan."""
+    import math
+    from cpu_data import (
+        CPU_SERIES,
+        compute_pool_chunk_bounds,
+        get_cpu_candidate_shapes,
+        normalize_cpu_series,
+    )
+
+    series = normalize_cpu_series(cpu_family)
+    if not series:
+        raise ValueError(f"Unknown CPU series '{cpu_family}'. Supported: {', '.join(CPU_SERIES.keys())}")
+
+    sinfo = CPU_SERIES[series]
+    target_vcpus = max(1, int(target_vcpus))
+    placement_scope = placement_scope if placement_scope in ("single_zone", "single_region", "multi_region") else "multi_region"
+    eff_min_cluster = target_vcpus if placement_scope == "single_zone" else max(1, min(target_vcpus, int(min_cluster_vcpus or 1)))
+
+    candidates = get_cpu_candidate_shapes(series, shape_class=shape_class, target_vcpus=target_vcpus)
+    if not candidates:
+        raise ValueError(f"No valid VM shapes found for CPU series {series} (shape_class={shape_class}).")
+
+    primary_shape = candidates[0]
+    series_zones = list(sinfo["zones"])
+    target_regions, allowed_zones = _resolve_regions_zones(regions, zones)
+
+    if allowed_zones:
+        valid_zones = [z for z in series_zones if z in allowed_zones]
+    elif target_regions:
+        valid_zones = [z for z in series_zones if z.rsplit("-", 1)[0] in target_regions]
+    else:
+        valid_zones = series_zones
+
+    if not valid_zones:
+        return {
+            "cpuFamily": series,
+            "processor": sinfo["processor"],
+            "architecture": sinfo["architecture"],
+            "targetVcpus": target_vcpus,
+            "placementScope": placement_scope,
+            "minClusterVcpus": eff_min_cluster,
+            "shapeClass": shape_class,
+            "candidateShapes": candidates,
+            "zoneScores": [],
+            "proposedPlan": [],
+            "totalPlannedVcpus": 0,
+            "summary": f"No supported {series} zones match the selected region/zone filter.",
+            "errors": [],
+        }
+
+    query_regions = sorted({z.rsplit("-", 1)[0] for z in valid_zones})
+    token = user_token or await get_gcloud_access_token()
+
+    # Query Capacity Advisory (Spot obtainability signal) concurrently across regions
+    tasks = [
+        _query_spot_advisory_region(token, project, reg, primary_shape["machine_type"])
+        for reg in query_regions
+    ]
+    raw_results = await asyncio.gather(*tasks, return_exceptions=True)
+
+    zone_score_map: dict[str, dict] = {}
+    errors: list[str] = []
+    valid_zone_set = set(valid_zones)
+    for reg, res in zip(query_regions, raw_results):
+        if isinstance(res, Exception):
+            errors.append(f"{reg}: {str(res)}")
+        elif res:
+            for rec in res:
+                z = rec.get("zone", "")
+                if z in valid_zone_set:
+                    zone_score_map[z] = {
+                        "region": reg,
+                        "zone": z,
+                        "machineType": primary_shape["machine_type"],
+                        "spotAvailability": rec.get("spotAvailability", "UNKNOWN"),
+                        "preemptionRate": rec.get("preemptionRate", "UNKNOWN"),
+                        "obtainability": float(rec.get("obtainability", 0.5) or 0.0),
+                        "uptimeScore": float(rec.get("uptimeScore", 0.5) or 0.0),
+                    }
+
+    # Fill any valid zones that did not return an explicit advisory score (graceful fallback)
+    for z in valid_zones:
+        if z not in zone_score_map:
+            zone_score_map[z] = {
+                "region": z.rsplit("-", 1)[0],
+                "zone": z,
+                "machineType": primary_shape["machine_type"],
+                "spotAvailability": "UNKNOWN",
+                "preemptionRate": "UNKNOWN",
+                "obtainability": 0.5,
+                "uptimeScore": 0.5,
+            }
+
+    ranked_zones = sorted(
+        zone_score_map.values(),
+        key=lambda item: (-item["obtainability"], -item["uptimeScore"], item["zone"]),
+    )
+
+    # Build a concrete proposed allocation plan respecting placement_scope & min_cluster_vcpus
+    proposed_plan: list[dict] = []
+    v_per_vm = primary_shape["vcpus"]
+
+    if placement_scope == "single_zone":
+        best = ranked_zones[0]
+        vms = max(1, math.ceil(target_vcpus / v_per_vm))
+        proposed_plan.append({
+            "region": best["region"],
+            "zone": best["zone"],
+            "machineType": primary_shape["machine_type"],
+            "vmCount": vms,
+            "vcpus": vms * v_per_vm,
+            "availability": best["spotAvailability"],
+            "obtainability": best["obtainability"],
+        })
+    elif placement_scope == "single_region":
+        # Pick the highest-scoring region (by average top-zone obtainability & zone count)
+        by_reg: dict[str, list[dict]] = {}
+        for zinfo in ranked_zones:
+            by_reg.setdefault(zinfo["region"], []).append(zinfo)
+        best_reg = sorted(
+            by_reg.items(),
+            key=lambda kv: (-sum(x["obtainability"] for x in kv[1]) / len(kv[1]), -len(kv[1]), kv[0]),
+        )[0][1]
+
+        # Distribute across up to min(len(best_reg), max_shards) zones in that single region
+        max_shards = max(1, min(len(best_reg), target_vcpus // max(1, eff_min_cluster)))
+        chosen_zones = best_reg[:max_shards]
+        remaining = target_vcpus
+        for idx, zinfo in enumerate(chosen_zones):
+            zones_left = len(chosen_zones) - idx
+            share_vcpus = remaining if zones_left == 1 else max(eff_min_cluster, math.ceil(remaining / zones_left))
+            min_vms, max_vms = compute_pool_chunk_bounds(share_vcpus, eff_min_cluster, v_per_vm, "single_region")
+            vms = max(min_vms, max_vms)
+            alloc_vcpus = vms * v_per_vm
+            proposed_plan.append({
+                "region": zinfo["region"],
+                "zone": zinfo["zone"],
+                "machineType": primary_shape["machine_type"],
+                "vmCount": vms,
+                "vcpus": alloc_vcpus,
+                "availability": zinfo["spotAvailability"],
+                "obtainability": zinfo["obtainability"],
+            })
+            remaining = max(0, remaining - alloc_vcpus)
+            if remaining == 0:
+                break
+    else:
+        # multi_region: spread across top-ranked zones (up to 4 shards by default for clean operational footprint)
+        max_shards = max(1, min(len(ranked_zones), min(4, max(1, target_vcpus // max(1, eff_min_cluster)))))
+        chosen_zones = ranked_zones[:max_shards]
+        remaining = target_vcpus
+        for idx, zinfo in enumerate(chosen_zones):
+            zones_left = len(chosen_zones) - idx
+            share_vcpus = remaining if zones_left == 1 else max(eff_min_cluster, math.ceil(remaining / zones_left))
+            min_vms, max_vms = compute_pool_chunk_bounds(share_vcpus, eff_min_cluster, v_per_vm, "multi_region")
+            vms = max(min_vms, max_vms)
+            alloc_vcpus = vms * v_per_vm
+            proposed_plan.append({
+                "region": zinfo["region"],
+                "zone": zinfo["zone"],
+                "machineType": primary_shape["machine_type"],
+                "vmCount": vms,
+                "vcpus": alloc_vcpus,
+                "availability": zinfo["spotAvailability"],
+                "obtainability": zinfo["obtainability"],
+            })
+            remaining = max(0, remaining - alloc_vcpus)
+            if remaining == 0:
+                break
+
+    total_planned = sum(p["vcpus"] for p in proposed_plan)
+    regions_used = sorted({p["region"] for p in proposed_plan})
+    zones_used = [p["zone"] for p in proposed_plan]
+    scope_desc = {
+        "single_zone": f"1 zone ({zones_used[0]})" if zones_used else "1 zone",
+        "single_region": f"1 region ({regions_used[0]}, {len(zones_used)} zone(s))" if regions_used else "1 region",
+        "multi_region": f"{len(regions_used)} region(s) / {len(zones_used)} zone(s) (min cluster >= {eff_min_cluster} vCPUs)",
+    }[placement_scope]
+
+    summary = (
+        f"Planned {total_planned} {series} vCPUs across {scope_desc} "
+        f"using primary shape {primary_shape['machine_type']} "
+        f"(fallback ladder: {', '.join(c['machine_type'] for c in candidates[1:5]) or 'none'})."
+    )
+
+    return {
+        "cpuFamily": series,
+        "processor": sinfo["processor"],
+        "architecture": sinfo["architecture"],
+        "targetVcpus": target_vcpus,
+        "placementScope": placement_scope,
+        "minClusterVcpus": eff_min_cluster,
+        "shapeClass": shape_class,
+        "candidateShapes": candidates,
+        "zoneScores": ranked_zones[:30],
+        "proposedPlan": proposed_plan,
+        "totalPlannedVcpus": total_planned,
+        "summary": summary,
+        "errors": errors,
+    }

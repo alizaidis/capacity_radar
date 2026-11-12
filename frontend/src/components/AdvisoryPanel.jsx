@@ -19,6 +19,7 @@ import ExpandLessIcon from '@mui/icons-material/ExpandLess'
 import CheckCircleOutlineIcon from '@mui/icons-material/CheckCircleOutline'
 import WarningAmberIcon from '@mui/icons-material/WarningAmber'
 import ErrorOutlineIcon from '@mui/icons-material/ErrorOutline'
+import DnsIcon from '@mui/icons-material/Dns'
 
 export default function AdvisoryPanel({ machineTypes = [], loading: mtLoading, project = '', userToken = '' }) {
   const authHeaders = userToken ? { Authorization: `Bearer ${userToken}` } : {}
@@ -62,11 +63,29 @@ export default function AdvisoryPanel({ machineTypes = [], loading: mtLoading, p
   const [flexLoading, setFlexLoading] = useState(false)
   const [flexError, setFlexError] = useState(null)
 
+  // CPU Pool Planner state
+  const [poolTargetVcpus, setPoolTargetVcpus] = useState(500)
+  const [poolScope, setPoolScope] = useState('multi_region')
+  const [poolMinCluster, setPoolMinCluster] = useState(30)
+  const [poolShapeClass, setPoolShapeClass] = useState('any')
+  const [poolResults, setPoolResults] = useState(null)
+  const [poolLoading, setPoolLoading] = useState(false)
+  const [poolError, setPoolError] = useState(null)
+  const [showPoolErrors, setShowPoolErrors] = useState(false)
+
+  const selectedSeriesRep = useMemo(() => {
+    if (category !== 'CPU' || !chip) return null
+    return machineTypes.find(mt => mt.category === 'CPU' && mt.chip === chip) || null
+  }, [category, chip, machineTypes])
+
   const selectedMachineInfo = useMemo(() => {
     return machineTypes.find(mt => mt.machineType === machineType)
   }, [machineType, machineTypes])
 
-  const availableZones = useMemo(() => selectedMachineInfo?.zones || [], [selectedMachineInfo])
+  const availableZones = useMemo(
+    () => selectedMachineInfo?.zones || selectedSeriesRep?.zones || [],
+    [selectedMachineInfo, selectedSeriesRep]
+  )
 
   const handleZoneChange = (event) => {
     setSelectedZones(typeof event.target.value === 'string' ? event.target.value.split(',') : event.target.value)
@@ -202,9 +221,44 @@ export default function AdvisoryPanel({ machineTypes = [], loading: mtLoading, p
     }
   }
 
+  const queryCpuPoolAdvisory = async () => {
+    if (!chip || !project) return
+    setPoolLoading(true)
+    setPoolError(null)
+    setPoolResults(null)
+    try {
+      const { zones, regions } = getZonesAndRegions()
+      const resp = await fetch('/api/advisory/cpu-pool', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json', ...authHeaders },
+        body: JSON.stringify({
+          project,
+          cpuFamily: chip,
+          targetVcpus: poolTargetVcpus,
+          placementScope: poolScope,
+          minClusterVcpus: poolScope === 'single_zone' ? poolTargetVcpus : poolMinCluster,
+          shapeClass: poolShapeClass,
+          regions,
+          zones,
+        }),
+      })
+      if (!resp.ok) {
+        let errMsg = `HTTP ${resp.status}`
+        try { const err = await resp.json(); errMsg = err.detail || errMsg } catch { /* non-JSON */ }
+        throw new Error(errMsg)
+      }
+      setPoolResults(await resp.json())
+    } catch (e) {
+      setPoolError(e.message)
+    } finally {
+      setPoolLoading(false)
+    }
+  }
+
   const supportsCalendar = selectedMachineInfo?.supported?.dws_calendar
   const supportsFlex = selectedMachineInfo?.supported?.dws_flex
   const canQuery = machineType && project
+  const canQueryCpuPool = category === 'CPU' && chip && project
   const anyLoading = calendarLoading || splitsLoading
 
   return (
@@ -215,7 +269,7 @@ export default function AdvisoryPanel({ machineTypes = [], loading: mtLoading, p
           Capacity Advisory
         </Typography>
         <Typography variant="body1" color="text.secondary">
-          Check GPU availability using DWS Calendar Mode, Spot VM, and DWS Flex Start Advisory APIs.
+          Check GPU, TPU, and CPU availability using Spot VM, DWS Calendar Mode, DWS Flex Start, and CPU Pool Advisory APIs.
         </Typography>
       </Box>
 
@@ -687,10 +741,121 @@ export default function AdvisoryPanel({ machineTypes = [], loading: mtLoading, p
               </>
             )}
 
-            {!flexResults && !flexLoading && !flexError && !machineType && (
+                {!flexResults && !flexLoading && !flexError && !machineType && (
               <Box sx={{ textAlign: 'center', py: 3, color: '#80868b' }}>
                 <HourglassBottomIcon sx={{ fontSize: 40, mb: 1, opacity: 0.3 }} />
                 <Typography variant="body2">Select a machine type above first</Typography>
+              </Box>
+            )}
+          </Paper>
+        </Grid>
+        )}
+
+        {/* CPU Broad vCPU Pool Capacity Planner */}
+        {category === 'CPU' && (
+        <Grid item xs={12} lg={6}>
+          <Paper sx={{ p: 3, height: '100%' }}>
+            <Box sx={{ display: 'flex', alignItems: 'center', gap: 1, mb: 2 }}>
+              <DnsIcon sx={{ color: '#137333', fontSize: 22 }} />
+              <Typography variant="h4">CPU vCPU Pool Planner</Typography>
+              <Chip label="Multi-Region / Scoped" size="small" sx={{ bgcolor: '#e6f4ea', color: '#137333', height: 20, fontSize: '0.62rem', fontWeight: 600 }} />
+              <Tooltip title="Plans how to fulfill a broad vCPU target (e.g. 500 C4A vCPUs) across single-zone, single-region, or multi-region clusters using Capacity Advisory scores.">
+                <InfoOutlinedIcon sx={{ fontSize: 16, color: '#80868b', cursor: 'help' }} />
+              </Tooltip>
+              {poolLoading && <CircularProgress size={18} sx={{ ml: 'auto' }} />}
+            </Box>
+
+            <Box sx={{ bgcolor: '#e6f4ea', borderRadius: 2, p: 2, mb: 2 }}>
+              <Grid container spacing={1.5}>
+                <Grid item xs={6} sm={3}>
+                  <TextField fullWidth type="number" label="Target vCPUs" value={poolTargetVcpus}
+                    onChange={(e) => setPoolTargetVcpus(Math.max(1, parseInt(e.target.value) || 1))}
+                    size="small" inputProps={{ min: 1, step: 16 }} />
+                </Grid>
+                <Grid item xs={6} sm={3}>
+                  <TextField fullWidth type="number" label="Min Cluster" value={poolScope === 'single_zone' ? poolTargetVcpus : poolMinCluster}
+                    onChange={(e) => setPoolMinCluster(Math.max(1, parseInt(e.target.value) || 1))}
+                    size="small" disabled={poolScope === 'single_zone'}
+                    helperText="Min vCPUs/zone" />
+                </Grid>
+                <Grid item xs={6} sm={3}>
+                  <TextField fullWidth select label="Scope" value={poolScope}
+                    onChange={(e) => setPoolScope(e.target.value)} size="small">
+                    <MenuItem value="multi_region">Multi-Region</MenuItem>
+                    <MenuItem value="single_region">Same Region</MenuItem>
+                    <MenuItem value="single_zone">Same Zone</MenuItem>
+                  </TextField>
+                </Grid>
+                <Grid item xs={6} sm={3}>
+                  <TextField fullWidth select label="Shape Class" value={poolShapeClass}
+                    onChange={(e) => setPoolShapeClass(e.target.value)} size="small">
+                    <MenuItem value="any">Any</MenuItem>
+                    <MenuItem value="highcpu">High-CPU</MenuItem>
+                    <MenuItem value="standard">Standard</MenuItem>
+                    <MenuItem value="highmem">High-Mem</MenuItem>
+                  </TextField>
+                </Grid>
+              </Grid>
+              <Button
+                fullWidth variant="contained"
+                sx={{ mt: 1.5, bgcolor: '#137333', '&:hover': { bgcolor: '#0d5324' } }}
+                onClick={queryCpuPoolAdvisory}
+                disabled={!canQueryCpuPool || poolLoading}
+                startIcon={poolLoading ? <CircularProgress size={16} /> : <DnsIcon />}
+              >
+                Plan {poolTargetVcpus} {chip || 'CPU'} vCPUs
+              </Button>
+            </Box>
+
+            {poolError && (
+              <Alert severity="error" sx={{ mb: 2 }}>
+                <AlertTitle>CPU Pool Planner Error</AlertTitle>
+                {poolError}
+              </Alert>
+            )}
+
+            {poolResults && (
+              <>
+                <Alert severity="success" sx={{ mb: 2, py: 0.5, '& .MuiAlert-message': { fontSize: '0.78rem' } }}>
+                  {poolResults.summary}
+                </Alert>
+                {(poolResults.proposedPlan || []).length > 0 && (
+                  <TableContainer sx={{ mb: 1.5 }}>
+                    <Table size="small">
+                      <TableHead>
+                        <TableRow>
+                          <TableCell>Region</TableCell>
+                          <TableCell>Zone</TableCell>
+                          <TableCell>Shape</TableCell>
+                          <TableCell>VMs</TableCell>
+                          <TableCell>vCPUs</TableCell>
+                          <TableCell>Signal</TableCell>
+                        </TableRow>
+                      </TableHead>
+                      <TableBody>
+                        {poolResults.proposedPlan.map((p, idx) => (
+                          <TableRow key={idx} hover sx={{ bgcolor: '#f8faf9' }}>
+                            <TableCell>{p.region}</TableCell>
+                            <TableCell sx={{ fontWeight: 500 }}>{p.zone}</TableCell>
+                            <TableCell sx={{ fontSize: '0.75rem' }}>{p.machineType}</TableCell>
+                            <TableCell>{p.vmCount}</TableCell>
+                            <TableCell sx={{ fontWeight: 600, color: '#137333' }}>{p.vcpus}</TableCell>
+                            <TableCell><AvailabilityChip availability={p.availability} /></TableCell>
+                          </TableRow>
+                        ))}
+                      </TableBody>
+                    </Table>
+                  </TableContainer>
+                )}
+                <ErrorsCollapse errors={poolResults.errors}
+                  show={showPoolErrors} setShow={setShowPoolErrors} />
+              </>
+            )}
+
+            {!poolResults && !poolLoading && !poolError && !chip && (
+              <Box sx={{ textAlign: 'center', py: 3, color: '#80868b' }}>
+                <DnsIcon sx={{ fontSize: 40, mb: 1, opacity: 0.3 }} />
+                <Typography variant="body2">Select a CPU Series above to plan a vCPU pool</Typography>
               </Box>
             )}
           </Paper>

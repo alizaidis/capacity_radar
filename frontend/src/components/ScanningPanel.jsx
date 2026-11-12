@@ -38,14 +38,21 @@ import HourglassEmptyIcon from '@mui/icons-material/HourglassEmpty'
 import LabelIcon from '@mui/icons-material/Label'
 import VisibilityIcon from '@mui/icons-material/Visibility'
 import VisibilityOffIcon from '@mui/icons-material/VisibilityOff'
-import { ToggleButton, ToggleButtonGroup, FormControlLabel, Switch } from '@mui/material'
+import PublicIcon from '@mui/icons-material/Public'
+import PlaceIcon from '@mui/icons-material/Place'
+import HubIcon from '@mui/icons-material/Hub'
+import TuneIcon from '@mui/icons-material/Tune'
+import {
+  ToggleButton, ToggleButtonGroup, FormControlLabel, Switch,
+  Table, TableBody, TableCell, TableContainer, TableHead, TableRow,
+} from '@mui/material'
 
 
 const METHOD_OPTIONS = [
-  { value: 'on_demand', label: 'On-Demand Reservation', icon: <StorageIcon sx={{ fontSize: 18 }} />, color: '#1a73e8', desc: 'Reserve GPU capacity (specific reservation) or create On-Demand TPU nodes.' },
+  { value: 'on_demand', label: 'On-Demand Reservation', icon: <StorageIcon sx={{ fontSize: 18 }} />, color: '#1a73e8', desc: 'Reserve GPU/CPU capacity (specific reservation) or create On-Demand TPU nodes.' },
   { value: 'dws_calendar', label: 'DWS Calendar Mode', icon: <CalendarMonthIcon sx={{ fontSize: 18 }} />, color: '#34a853', desc: 'Submit a Future Reservation (Calendar Mode) for a 1–90 day window.' },
   { value: 'dws_flex', label: 'DWS Flex Start', icon: <CloudQueueIcon sx={{ fontSize: 18 }} />, color: '#9334e6', desc: 'Queue for DWS Flex Start capacity. Starts when available (max 7 days runtime).' },
-  { value: 'spot', label: 'Spot VMs', icon: <BoltIcon sx={{ fontSize: 18 }} />, color: '#f9ab00', desc: 'Spare capacity at discount. Can be preempted anytime.' },
+  { value: 'spot', label: 'Spot VMs', icon: <BoltIcon sx={{ fontSize: 18 }} />, color: '#f9ab00', desc: 'Spare capacity at discount (uses atomic bulkInsert for CPU pools).' },
 ]
 
 const DEFAULT_PRIORITY = {
@@ -77,6 +84,18 @@ export default function ScanningPanel({ machineTypes = [], loading: mtLoading, p
   const [executionMode, setExecutionMode] = useState('sequential')
   const [showUnsupported, setShowUnsupported] = useState(false)
 
+  // CPU Broad vCPU Pool state
+  const [sizingMode, setSizingMode] = useState('exact_shape')        // 'exact_shape' | 'vcpu_pool'
+  const [targetVcpus, setTargetVcpus] = useState(500)
+  const [minTotalVcpus, setMinTotalVcpus] = useState(500)
+  const [placementScope, setPlacementScope] = useState('multi_region') // 'multi_region' | 'single_region' | 'single_zone'
+  const [minClusterVcpus, setMinClusterVcpus] = useState(30)
+  const [shapeClass, setShapeClass] = useState('any')
+  const [targetRegions, setTargetRegions] = useState([])
+  const [scanResult, setScanResult] = useState(null)
+
+  const isCpuPool = category === 'CPU' && sizingMode === 'vcpu_pool'
+
   // VPC network selection (empty = auto-select: prefer 'default', else first
   // VPC with a subnet in the region). Fixes deploys on projects without a
   // 'default' VPC and lets the user pick or create one.
@@ -98,13 +117,27 @@ export default function ScanningPanel({ machineTypes = [], loading: mtLoading, p
   const wsRef = useRef(null)
   const logContainerRef = useRef(null)
 
-  // Machine type info
+  // Machine type or CPU series info
+  const selectedSeriesRep = useMemo(() => {
+    if (category !== 'CPU' || !chip) return null
+    return machineTypes.find(mt => mt.category === 'CPU' && mt.chip === chip) || null
+  }, [category, chip, machineTypes])
+
   const selectedMachineInfo = useMemo(() => {
+    if (isCpuPool) return selectedSeriesRep
     return machineTypes.find(mt => mt.machineType === machineType)
-  }, [machineType, machineTypes])
+  }, [isCpuPool, selectedSeriesRep, machineType, machineTypes])
 
   const availableZones = useMemo(() => {
-    return selectedMachineInfo?.zones || []
+    const allZones = selectedMachineInfo?.zones || []
+    if (isCpuPool && targetRegions.length > 0) {
+      return allZones.filter(z => targetRegions.includes(z.slice(0, z.lastIndexOf('-'))))
+    }
+    return allZones
+  }, [selectedMachineInfo, isCpuPool, targetRegions])
+
+  const availableRegions = useMemo(() => {
+    return selectedMachineInfo?.regions || []
   }, [selectedMachineInfo])
 
   // Auto-scroll only the log container (not the page)
@@ -250,11 +283,13 @@ export default function ScanningPanel({ machineTypes = [], loading: mtLoading, p
 
   // Start scan
   const startScan = useCallback(() => {
-    if (!machineType || !project || priorities.length === 0) return
+    const hasTarget = isCpuPool ? !!chip : !!machineType
+    if (!hasTarget || !project || priorities.length === 0) return
 
     setScanning(true)
     setScanStatus('running')
     setLogs([])
+    setScanResult(null)
     setSessionId(null)
     setProgress(0)
 
@@ -266,11 +301,19 @@ export default function ScanningPanel({ machineTypes = [], loading: mtLoading, p
     ws.onopen = () => {
       const config = {
         project,
-        machineType,
+        machineType: isCpuPool ? '' : machineType,
         vmCount: maxVmCount,
         minVmCount,
         maxVmCount,
         totalHuntingHours,
+        sizingMode: isCpuPool ? 'vcpu_pool' : 'exact_shape',
+        cpuFamily: isCpuPool ? chip : '',
+        targetVcpus: isCpuPool ? targetVcpus : 500,
+        minTotalVcpus: isCpuPool ? minTotalVcpus : targetVcpus,
+        placementScope: isCpuPool ? placementScope : 'multi_region',
+        minClusterVcpus: isCpuPool ? (placementScope === 'single_zone' ? targetVcpus : minClusterVcpus) : 30,
+        shapeClass: isCpuPool ? shapeClass : 'any',
+        targetRegions: isCpuPool ? targetRegions : [],
         priorities: priorities.map(p => {
           const defaultZonesForMethod = (
             p.method === 'dws_calendar' && !showUnsupported && selectedMachineInfo?.calendarZones?.length > 0
@@ -302,7 +345,11 @@ export default function ScanningPanel({ machineTypes = [], loading: mtLoading, p
         if (data.type === 'session_created') setSessionId(data.sessionId)
         setLogs(prev => [...prev, data])
 
-        if (data.type === 'success') { setScanStatus('success'); setScanning(false) }
+        if (data.type === 'success') {
+          setScanStatus('success')
+          setScanning(false)
+          if (data.data?.result) setScanResult(data.data.result)
+        }
         else if (data.type === 'failed') { setScanStatus('failed'); setScanning(false) }
         else if (data.type === 'cancelled') { setScanStatus('cancelled'); setScanning(false) }
         else if (data.type === 'error' && data.status === 'failed') { setScanStatus('failed'); setScanning(false) }
@@ -324,7 +371,12 @@ export default function ScanningPanel({ machineTypes = [], loading: mtLoading, p
       setScanning(false)
       setScanStatus(prev => prev === 'running' ? 'cancelled' : prev)
     }
-  }, [machineType, project, priorities, minVmCount, maxVmCount, totalHuntingHours, availableZones, executionMode, userToken, selectedNetwork, selectedSubnetwork])
+  }, [
+    isCpuPool, chip, machineType, project, priorities, minVmCount, maxVmCount,
+    totalHuntingHours, targetVcpus, minTotalVcpus, placementScope, minClusterVcpus,
+    shapeClass, targetRegions, availableZones, executionMode, userToken,
+    selectedNetwork, selectedSubnetwork, showUnsupported, selectedMachineInfo,
+  ])
 
 
   const cancelScan = useCallback(() => {
@@ -347,14 +399,15 @@ export default function ScanningPanel({ machineTypes = [], loading: mtLoading, p
     }
   }, [sessionId])
 
-  const canStart = machineType && project && priorities.length > 0 && !scanning
+  const hasTargetSelected = isCpuPool ? !!chip : !!machineType
+  const canStart = hasTargetSelected && project && priorities.length > 0 && !scanning
 
   return (
     <Box>
       <Box sx={{ mb: 3 }}>
         <Typography variant="h2" sx={{ mb: 0.5, color: '#202124' }}>Scan & Deploy</Typography>
         <Typography variant="body1" color="text.secondary">
-          Scan for available GPU/TPU capacity and automatically deploy reservations or VMs.
+          Scan for available GPU, TPU, or CPU capacity and automatically deploy reservations or VMs.
         </Typography>
       </Box>
 
@@ -369,51 +422,242 @@ export default function ScanningPanel({ machineTypes = [], loading: mtLoading, p
             <Box sx={{ mb: 2 }}>
               <MachineTypeSelector
                 machineTypes={machineTypes} category={category}
-                setCategory={(val) => { setCategory(val); setPriorities(priorities.map(p => ({ ...p, zones: [] }))) }}
+                setCategory={(val) => {
+                  setCategory(val)
+                  if (val !== 'CPU') setSizingMode('exact_shape')
+                  setTargetRegions([])
+                  setPriorities(priorities.map(p => ({ ...p, zones: [] })))
+                }}
                 chip={chip}
-                setChip={(val) => { setChip(val); setPriorities(priorities.map(p => ({ ...p, zones: [] }))) }}
+                setChip={(val) => {
+                  setChip(val)
+                  setTargetRegions([])
+                  setPriorities(priorities.map(p => ({ ...p, zones: [] })))
+                }}
                 machineType={machineType}
                 setMachineType={(val) => { setMachineType(val); setPriorities(priorities.map(p => ({ ...p, zones: [] }))) }}
+                sizingMode={sizingMode}
+                shapeClass={shapeClass}
+                setShapeClass={setShapeClass}
                 disabled={scanning}
               />
             </Box>
-            <Grid container spacing={2}>
-              <Grid item xs={6} sm={3}>
-                <TextField fullWidth type="number" label="Min VMs / Nodes" value={minVmCount}
-                  onChange={(e) => {
-                    const val = Math.max(1, parseInt(e.target.value) || 1)
-                    setMinVmCount(val)
-                    if (val > maxVmCount) setMaxVmCount(val)
-                  }}
-                  size="small" inputProps={{ min: 1 }} disabled={scanning}
-                  helperText="Minimum required"
-                />
-              </Grid>
-              <Grid item xs={6} sm={3}>
-                <TextField fullWidth type="number" label="Max VMs / Nodes" value={maxVmCount}
-                  onChange={(e) => {
-                    const val = Math.max(minVmCount, parseInt(e.target.value) || 1)
-                    setMaxVmCount(val)
-                  }}
-                  size="small" inputProps={{ min: minVmCount }} disabled={scanning}
-                  helperText="Ideal target"
-                />
-              </Grid>
-              <Grid item xs={6} sm={3}>
-                <TextField fullWidth type="number" label="Total Hunting Time (hrs)" value={totalHuntingHours}
-                  onChange={(e) => setTotalHuntingHours(Math.max(0.1, parseFloat(e.target.value) || 1))}
-                  size="small" inputProps={{ min: 0.1, step: 0.5 }} disabled={scanning}
-                  helperText="Max time to scan"
-                />
-              </Grid>
-            </Grid>
-            <Box sx={{ mt: 1, display: 'flex', alignItems: 'center', gap: 0.5 }}>
-              <InfoOutlinedIcon sx={{ fontSize: 13, color: '#80868b' }} />
-              <Typography variant="caption" sx={{ color: '#80868b', fontSize: '0.68rem' }}>
-                Total hunting time is the max wait time for trying all priorities. It excludes resource provisioning time.
-                {minVmCount < maxVmCount && ` System will try for ${maxVmCount} VMs first, scaling down to ${minVmCount} if needed.`}
-              </Typography>
-            </Box>
+
+            {/* CPU Sizing Mode Switcher: Exact VM Shape vs Broad vCPU Pool */}
+            {category === 'CPU' && (
+              <Box sx={{ mb: 2.5, p: 1.5, bgcolor: '#f1f8f4', borderRadius: 1.5, border: '1px solid #ceead6' }}>
+                <Box sx={{ display: 'flex', alignItems: 'center', justifyContent: 'space-between', flexWrap: 'wrap', gap: 1 }}>
+                  <Box sx={{ display: 'flex', alignItems: 'center', gap: 0.75 }}>
+                    <TuneIcon sx={{ fontSize: 16, color: '#137333' }} />
+                    <Typography variant="caption" sx={{ fontWeight: 600, color: '#137333', fontSize: '0.75rem' }}>
+                      CPU Hunting Mode
+                    </Typography>
+                  </Box>
+                  <ToggleButtonGroup
+                    value={sizingMode}
+                    exclusive
+                    size="small"
+                    disabled={scanning}
+                    onChange={(_, val) => {
+                      if (val) {
+                        setSizingMode(val)
+                        setPriorities(priorities.map(p => ({ ...p, zones: [] })))
+                      }
+                    }}
+                    sx={{ bgcolor: '#fff', '& .MuiToggleButton-root': { py: 0.4, px: 1.75, textTransform: 'none', fontSize: '0.76rem', fontWeight: 500 } }}
+                  >
+                    <ToggleButton value="exact_shape">
+                      Exact VM Shape (e.g. c4a-highcpu-64)
+                    </ToggleButton>
+                    <ToggleButton value="vcpu_pool">
+                      Broad vCPU Pool (e.g. 500 vCPUs anywhere)
+                    </ToggleButton>
+                  </ToggleButtonGroup>
+                </Box>
+              </Box>
+            )}
+
+            {/* Sizing Inputs: Either Exact VM Shape OR Broad vCPU Pool */}
+            {!isCpuPool ? (
+              <>
+                <Grid container spacing={2}>
+                  <Grid item xs={6} sm={4}>
+                    <TextField fullWidth type="number" label="Min VMs / Nodes" value={minVmCount}
+                      onChange={(e) => {
+                        const val = Math.max(1, parseInt(e.target.value) || 1)
+                        setMinVmCount(val)
+                        if (val > maxVmCount) setMaxVmCount(val)
+                      }}
+                      size="small" inputProps={{ min: 1 }} disabled={scanning}
+                      helperText={category === 'CPU' && selectedMachineInfo?.vcpus ? `Min ${minVmCount * selectedMachineInfo.vcpus} vCPUs` : 'Minimum required'}
+                    />
+                  </Grid>
+                  <Grid item xs={6} sm={4}>
+                    <TextField fullWidth type="number" label="Max VMs / Nodes" value={maxVmCount}
+                      onChange={(e) => {
+                        const val = Math.max(minVmCount, parseInt(e.target.value) || 1)
+                        setMaxVmCount(val)
+                      }}
+                      size="small" inputProps={{ min: minVmCount }} disabled={scanning}
+                      helperText={category === 'CPU' && selectedMachineInfo?.vcpus ? `Target ${maxVmCount * selectedMachineInfo.vcpus} vCPUs` : 'Ideal target'}
+                    />
+                  </Grid>
+                  <Grid item xs={12} sm={4}>
+                    <TextField fullWidth type="number" label="Total Hunting Time (hrs)" value={totalHuntingHours}
+                      onChange={(e) => setTotalHuntingHours(Math.max(0.1, parseFloat(e.target.value) || 1))}
+                      size="small" inputProps={{ min: 0.1, step: 0.5 }} disabled={scanning}
+                      helperText="Max time to scan"
+                    />
+                  </Grid>
+                </Grid>
+                <Box sx={{ mt: 1, display: 'flex', alignItems: 'center', gap: 0.5 }}>
+                  <InfoOutlinedIcon sx={{ fontSize: 13, color: '#80868b' }} />
+                  <Typography variant="caption" sx={{ color: '#80868b', fontSize: '0.68rem' }}>
+                    Total hunting time is the max wait time for trying all priorities. It excludes resource provisioning time.
+                    {minVmCount < maxVmCount && ` System will try for ${maxVmCount} VMs first, scaling down to ${minVmCount} if needed.`}
+                  </Typography>
+                </Box>
+              </>
+            ) : (
+              <Box sx={{ p: 2, bgcolor: '#f8f9fa', borderRadius: 1.5, border: '1px solid #dadce0' }}>
+                <Grid container spacing={2}>
+                  <Grid item xs={6} sm={3}>
+                    <TextField
+                      fullWidth type="number" label="Target vCPUs" value={targetVcpus}
+                      onChange={(e) => {
+                        const val = Math.max(1, parseInt(e.target.value) || 1)
+                        setTargetVcpus(val)
+                        setMinTotalVcpus(val)
+                        if (minClusterVcpus > val) setMinClusterVcpus(val)
+                      }}
+                      size="small" inputProps={{ min: 1, step: 16 }} disabled={scanning}
+                      helperText="Total vCPU goal"
+                    />
+                  </Grid>
+                  <Grid item xs={6} sm={3}>
+                    <TextField
+                      fullWidth type="number" label="Min Total vCPUs" value={minTotalVcpus}
+                      onChange={(e) => {
+                        const val = Math.max(1, Math.min(targetVcpus, parseInt(e.target.value) || 1))
+                        setMinTotalVcpus(val)
+                      }}
+                      size="small" inputProps={{ min: 1, max: targetVcpus }} disabled={scanning}
+                      helperText="Min acceptable pool"
+                    />
+                  </Grid>
+                  <Grid item xs={6} sm={3}>
+                    <TextField
+                      fullWidth type="number" label="Min Cluster (vCPUs)"
+                      value={placementScope === 'single_zone' ? targetVcpus : minClusterVcpus}
+                      onChange={(e) => {
+                        const val = Math.max(1, Math.min(targetVcpus, parseInt(e.target.value) || 1))
+                        setMinClusterVcpus(val)
+                      }}
+                      size="small"
+                      inputProps={{ min: 1, max: targetVcpus }}
+                      disabled={scanning || placementScope === 'single_zone'}
+                      helperText={placementScope === 'single_zone' ? 'All in 1 zone' : 'Min vCPUs / zone'}
+                    />
+                  </Grid>
+                  <Grid item xs={6} sm={3}>
+                    <TextField
+                      fullWidth type="number" label="Hunting Time (hrs)" value={totalHuntingHours}
+                      onChange={(e) => setTotalHuntingHours(Math.max(0.1, parseFloat(e.target.value) || 1))}
+                      size="small" inputProps={{ min: 0.1, step: 0.5 }} disabled={scanning}
+                      helperText="Max time to scan"
+                    />
+                  </Grid>
+
+                  {/* Placement Scope */}
+                  <Grid item xs={12} sm={7}>
+                    <TextField
+                      fullWidth select size="small" label="Placement Scope"
+                      value={placementScope}
+                      onChange={(e) => setPlacementScope(e.target.value)}
+                      disabled={scanning}
+                      helperText={
+                        placementScope === 'multi_region'
+                          ? `Spread across any regions/zones (each local cluster >= ${minClusterVcpus} vCPUs)`
+                          : placementScope === 'single_region'
+                            ? `All ${targetVcpus} vCPUs within 1 region (auto-rolls back incomplete regions)`
+                            : `All ${targetVcpus} vCPUs within 1 single zone`
+                      }
+                    >
+                      <MenuItem value="multi_region">
+                        <Box sx={{ display: 'flex', alignItems: 'center', gap: 1 }}>
+                          <PublicIcon sx={{ fontSize: 16, color: '#1a73e8' }} />
+                          <Box>
+                            <Typography variant="body2" sx={{ fontWeight: 500, lineHeight: 1.2 }}>Multi-Region / Multi-Zone Spread</Typography>
+                            <Typography variant="caption" color="text.secondary" sx={{ fontSize: '0.65rem' }}>Grab wherever available with min local cluster size</Typography>
+                          </Box>
+                        </Box>
+                      </MenuItem>
+                      <MenuItem value="single_region">
+                        <Box sx={{ display: 'flex', alignItems: 'center', gap: 1 }}>
+                          <HubIcon sx={{ fontSize: 16, color: '#137333' }} />
+                          <Box>
+                            <Typography variant="body2" sx={{ fontWeight: 500, lineHeight: 1.2 }}>Same Region (Any or Specific)</Typography>
+                            <Typography variant="caption" color="text.secondary" sx={{ fontSize: '0.65rem' }}>All vCPUs in a single region across its zones</Typography>
+                          </Box>
+                        </Box>
+                      </MenuItem>
+                      <MenuItem value="single_zone">
+                        <Box sx={{ display: 'flex', alignItems: 'center', gap: 1 }}>
+                          <PlaceIcon sx={{ fontSize: 16, color: '#9334e6' }} />
+                          <Box>
+                            <Typography variant="body2" sx={{ fontWeight: 500, lineHeight: 1.2 }}>Same Zone (Any or Specific)</Typography>
+                            <Typography variant="caption" color="text.secondary" sx={{ fontSize: '0.65rem' }}>All vCPUs co-located in one single zone</Typography>
+                          </Box>
+                        </Box>
+                      </MenuItem>
+                    </TextField>
+                  </Grid>
+
+                  {/* Optional Region Scope Filter */}
+                  <Grid item xs={12} sm={5}>
+                    <FormControl fullWidth size="small" disabled={scanning || !chip}>
+                      <InputLabel>Regions Filter</InputLabel>
+                      <Select
+                        multiple
+                        value={targetRegions}
+                        onChange={(e) => {
+                          const val = typeof e.target.value === 'string' ? e.target.value.split(',') : e.target.value
+                          setTargetRegions(val)
+                          setPriorities(priorities.map(p => ({ ...p, zones: [] })))
+                        }}
+                        input={<OutlinedInput label="Regions Filter" />}
+                        renderValue={(selected) =>
+                          selected.length === 0
+                            ? `Anywhere (${availableRegions.length || 0} regions)`
+                            : `${selected.length} region(s)`
+                        }
+                      >
+                        {availableRegions.map(reg => (
+                          <MenuItem key={reg} value={reg} dense>
+                            <Checkbox checked={targetRegions.indexOf(reg) > -1} size="small" />
+                            <ListItemText primary={reg} primaryTypographyProps={{ fontSize: '0.8rem' }} />
+                          </MenuItem>
+                        ))}
+                      </Select>
+                    </FormControl>
+                  </Grid>
+                </Grid>
+
+                {chip && (
+                  <Alert severity="info" sx={{ mt: 1.5, py: 0.4, '& .MuiAlert-message': { fontSize: '0.72rem' } }}>
+                    {placementScope === 'multi_region' && (
+                      <>Hunts <strong>{targetVcpus} {chip} vCPUs</strong> across <strong>{targetRegions.length > 0 ? `${targetRegions.length} selected region(s)` : `all ${availableRegions.length} regions (${availableZones.length} zones)`}</strong>, enforcing <strong>&ge; {minClusterVcpus} vCPUs</strong> per local zone cluster.</>
+                    )}
+                    {placementScope === 'single_region' && (
+                      <>Finds <strong>{targetRegions.length === 1 ? `region ${targetRegions[0]}` : `any single region (${targetRegions.length || availableRegions.length} candidate regions)`}</strong> able to supply <strong>all {targetVcpus} {chip} vCPUs</strong> (&ge; {minClusterVcpus} vCPUs/zone), rolling back incomplete regions automatically.</>
+                    )}
+                    {placementScope === 'single_zone' && (
+                      <>Finds <strong>any single zone ({availableZones.length} candidate zones)</strong> able to supply <strong>all {targetVcpus} {chip} vCPUs</strong> using the {chip} shape ladder.</>
+                    )}
+                  </Alert>
+                )}
+              </Box>
+            )}
 
             {/* VPC Network selection (GPU + TPU). Empty = auto (prefer 'default'). */}
             <Box sx={{ mt: 2, p: 1.5, bgcolor: '#f8f9fa', borderRadius: 1, border: '1px solid #e8eaed' }}>
@@ -505,7 +749,7 @@ export default function ScanningPanel({ machineTypes = [], loading: mtLoading, p
             </Box>
 
             {/* Show unsupported toggle */}
-            {machineType && (
+            {hasTargetSelected && (
               <Box sx={{ mb: 1.5, display: 'flex', alignItems: 'center', gap: 1 }}>
                 <FormControlLabel
                   control={
@@ -542,7 +786,7 @@ export default function ScanningPanel({ machineTypes = [], loading: mtLoading, p
                       <Chip label={`#${index + 1}`} size="small"
                         sx={{ bgcolor: methodInfo?.color || '#1a73e8', color: '#fff', fontWeight: 700, height: 24, width: 36, fontSize: '0.75rem' }} />
                       <Typography variant="h6" sx={{ fontWeight: 500, flex: 1 }}>{methodInfo?.label || 'Priority'}</Typography>
-                      {!isSupported && machineType && (
+                      {!isSupported && hasTargetSelected && (
                         <Chip label="Not supported" size="small" color="error" variant="outlined" sx={{ height: 22, fontSize: '0.65rem' }} />
                       )}
                       <IconButton size="small" onClick={() => movePriority(index, -1)} disabled={index === 0 || scanning}>
@@ -561,9 +805,9 @@ export default function ScanningPanel({ machineTypes = [], loading: mtLoading, p
                         <TextField fullWidth select label="Method" value={priority.method}
                           onChange={(e) => updatePriority(index, 'method', e.target.value)} size="small" disabled={scanning}>
                           {METHOD_OPTIONS
-                            .filter(opt => showUnsupported || !machineType || selectedMachineInfo?.supported?.[opt.value] !== false)
+                            .filter(opt => showUnsupported || !hasTargetSelected || selectedMachineInfo?.supported?.[opt.value] !== false)
                             .map(opt => {
-                              const supported = !machineType || selectedMachineInfo?.supported?.[opt.value] !== false
+                              const supported = !hasTargetSelected || selectedMachineInfo?.supported?.[opt.value] !== false
                               return (
                                 <MenuItem key={opt.value} value={opt.value}>
                                   <Box sx={{ display: 'flex', alignItems: 'center', gap: 1, opacity: supported ? 1 : 0.5 }}>
@@ -587,8 +831,8 @@ export default function ScanningPanel({ machineTypes = [], loading: mtLoading, p
                           <Select multiple value={priority.zones}
                             onChange={(e) => updatePriority(index, 'zones', e.target.value)}
                             input={<OutlinedInput label="Zones" />}
-                            renderValue={(selected) => selected.length === 0 ? 'All available' : `${selected.length} zones`}
-                            disabled={!machineType || scanning}>
+                            renderValue={(selected) => selected.length === 0 ? `All available (${priorityZones.length})` : `${selected.length} zones`}
+                            disabled={!hasTargetSelected || scanning}>
                             {priorityZones.map(zone => (
                               <MenuItem key={zone} value={zone} dense>
                                 <Checkbox checked={priority.zones.indexOf(zone) > -1} size="small" />
@@ -627,7 +871,7 @@ export default function ScanningPanel({ machineTypes = [], loading: mtLoading, p
                         <Grid item xs={12} sm={6}>
                           <Typography variant="caption" color="text.secondary">
                             Preview: <code style={{ fontSize: '0.7rem', background: '#e8eaed', padding: '2px 6px', borderRadius: 3 }}>
-                              {priority.namePrefix ? `${priority.namePrefix}-` : 'gpu-radar-'}{priority.method === 'spot' ? 'spot' : priority.method === 'dws_calendar' ? 'cal' : priority.method === 'dws_flex' ? 'flex' : 'od'}-xxxxxxxx-zone
+                              {priority.namePrefix ? `${priority.namePrefix}-` : (category === 'CPU' ? 'cpu-radar-' : 'gpu-radar-')}{priority.method === 'spot' ? 'spot' : priority.method === 'dws_calendar' ? 'cal' : priority.method === 'dws_flex' ? 'flex' : 'od'}-xxxxxxxx-zone
                             </code>
                           </Typography>
                         </Grid>
@@ -843,7 +1087,42 @@ export default function ScanningPanel({ machineTypes = [], loading: mtLoading, p
             {scanStatus === 'success' && (
               <Alert severity="success" icon={<CloudDoneIcon />} sx={{ mt: 2 }}>
                 <AlertTitle>Deployed Successfully</AlertTitle>
-                Capacity has been secured and verified. Check the logs above for resource details.
+                {scanResult?.sizing_mode === 'vcpu_pool' ? (
+                  <Box>
+                    <Typography variant="body2" sx={{ mb: 1 }}>
+                      Secured <strong>{scanResult.total_vcpus} {scanResult.cpu_family} vCPUs</strong> across{' '}
+                      <strong>{scanResult.shards?.length || 0} cluster shard(s)</strong> ({scanResult.vm_count} total VMs).
+                    </Typography>
+                    {scanResult.shards?.length > 0 && (
+                      <TableContainer sx={{ bgcolor: '#fff', borderRadius: 1, border: '1px solid #ceead6' }}>
+                        <Table size="small">
+                          <TableHead>
+                            <TableRow>
+                              <TableCell sx={{ fontSize: '0.72rem', fontWeight: 600 }}>Zone</TableCell>
+                              <TableCell sx={{ fontSize: '0.72rem', fontWeight: 600 }}>Shape</TableCell>
+                              <TableCell sx={{ fontSize: '0.72rem', fontWeight: 600 }}>VMs</TableCell>
+                              <TableCell sx={{ fontSize: '0.72rem', fontWeight: 600 }}>vCPUs</TableCell>
+                              <TableCell sx={{ fontSize: '0.72rem', fontWeight: 600 }}>Resource</TableCell>
+                            </TableRow>
+                          </TableHead>
+                          <TableBody>
+                            {scanResult.shards.map((sh, idx) => (
+                              <TableRow key={idx}>
+                                <TableCell sx={{ fontSize: '0.72rem', fontWeight: 500 }}>{sh.zone}</TableCell>
+                                <TableCell sx={{ fontSize: '0.72rem' }}>{sh.machine_type}</TableCell>
+                                <TableCell sx={{ fontSize: '0.72rem' }}>{sh.vm_count}</TableCell>
+                                <TableCell sx={{ fontSize: '0.72rem', fontWeight: 600, color: '#137333' }}>{sh.vcpus}</TableCell>
+                                <TableCell sx={{ fontSize: '0.68rem', fontFamily: '"Roboto Mono", monospace' }}>{sh.resource_name}</TableCell>
+                              </TableRow>
+                            ))}
+                          </TableBody>
+                        </Table>
+                      </TableContainer>
+                    )}
+                  </Box>
+                ) : (
+                  'Capacity has been secured and verified. Check the logs above for resource details.'
+                )}
               </Alert>
             )}
             {scanStatus === 'failed' && (

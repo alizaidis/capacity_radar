@@ -17,14 +17,24 @@ from enum import Enum
 from gpu_data import (
     MACHINE_TYPES,
     TPU_TYPES,
+    get_gce_machine_info,
     get_zones_for_machine_type,
     get_calendar_zones_for_machine_type,
     get_calendar_config_for_machine_type,
     get_tpu_spec,
     is_consumption_supported,
+    is_cpu_machine_type,
     FAMILY_TO_GPU_ZONE_KEY,
     MACHINE_TO_FAMILY,
     GPU_ZONES,
+)
+from cpu_data import (
+    CPU_MACHINE_TYPES,
+    CPU_SERIES,
+    compute_pool_chunk_bounds,
+    get_cpu_candidate_shapes,
+    get_cpu_zones_for_series,
+    normalize_cpu_series,
 )
 
 logger = logging.getLogger(__name__)
@@ -88,7 +98,7 @@ def _normalize_datetime(dt_str: str) -> str:
 
 
 class ScanningSession:
-    """Manages a GPU/TPU scanning session with priority-based strategy."""
+    """Manages a GPU/TPU/CPU scanning session with priority-based and flexible vCPU pool strategies."""
 
     def __init__(
         self,
@@ -105,6 +115,14 @@ class ScanningSession:
         min_vm_count: Optional[int] = None,
         max_vm_count: Optional[int] = None,
         total_hunting_hours: float = 1.0,
+        sizing_mode: str = "exact_shape",
+        cpu_family: str = "",
+        target_vcpus: int = 0,
+        min_total_vcpus: Optional[int] = None,
+        placement_scope: str = "multi_region",
+        min_cluster_vcpus: int = 30,
+        shape_class: str = "any",
+        target_regions: Optional[list[str]] = None,
     ):
         self.session_id = session_id
         self.project = project
@@ -125,6 +143,28 @@ class ScanningSession:
         self.network = network or ""
         self.subnetwork = subnetwork or ""
         self._deploy_start_time = datetime.now(timezone.utc)
+        self._last_completed_op = None
+
+        # CPU Broad vCPU Pool configuration
+        self.sizing_mode = sizing_mode if sizing_mode in ("exact_shape", "vcpu_pool") else "exact_shape"
+        self.cpu_family = normalize_cpu_series(cpu_family) or (cpu_family.strip().upper() if cpu_family else "")
+        self.target_vcpus = max(1, int(target_vcpus or 64)) if self.sizing_mode == "vcpu_pool" else 0
+        self.min_total_vcpus = (
+            max(1, min(self.target_vcpus, int(min_total_vcpus)))
+            if (self.sizing_mode == "vcpu_pool" and min_total_vcpus is not None)
+            else self.target_vcpus
+        )
+        self.placement_scope = (
+            placement_scope if placement_scope in ("single_zone", "single_region", "multi_region") else "multi_region"
+        )
+        self.min_cluster_vcpus = (
+            self.target_vcpus
+            if self.placement_scope == "single_zone"
+            else max(1, min(self.target_vcpus or 1, int(min_cluster_vcpus or 1)))
+        )
+        self.shape_class = (shape_class or "any").strip().lower()
+        self.target_regions = [r.strip() for r in (target_regions or []) if r and r.strip()]
+        self._shard_counter = 0
 
     def _is_hunting_expired(self) -> bool:
         """Check whether the total hunting time window has elapsed."""
@@ -246,16 +286,24 @@ class ScanningSession:
                 err_msg = errs[0].get("message", "Unknown error") if errs else "Unknown error"
                 await self.emit("warning", f"⚠️ [{label}] Operation completed with error: {err_msg}")
                 return False
+            self._last_completed_op = operation_data
             return True
 
         await self.emit("info", f"⏳ [{label}] Operation {op_name[:20]}... submitted. Polling status...")
 
         op_zone = operation_data.get("zone", "")
+        op_region = operation_data.get("region", "")
         if "/zones/" in op_zone:
             op_zone_name = op_zone.split("/zones/")[-1]
             poll_url = (
                 f"https://compute.googleapis.com/compute/v1/projects/{self.project}"
                 f"/zones/{op_zone_name}/operations/{op_name}"
+            )
+        elif "/regions/" in op_region:
+            op_reg_name = op_region.split("/regions/")[-1]
+            poll_url = (
+                f"https://compute.googleapis.com/compute/v1/projects/{self.project}"
+                f"/regions/{op_reg_name}/operations/{op_name}"
             )
         elif zone:
             poll_url = (
@@ -299,6 +347,7 @@ class ScanningSession:
                                 f"⚠️ [{label}] Operation finished with ERROR: {err_msg}",
                             )
                             return False
+                        self._last_completed_op = op
                         await self.emit(
                             "info",
                             f"✅ [{label}] Operation verified DONE — resource successfully created!",
@@ -334,17 +383,23 @@ class ScanningSession:
     # ── Main run logic ─────────────────────────────────────────────────
     async def run(self, parallel: bool = False):
         self.status = ScanningStatus.RUNNING
+        if self.sizing_mode == "vcpu_pool":
+            await self._run_cpu_vcpu_pool(parallel=parallel)
+            return
+
         mode_label = "⚡ PARALLEL" if parallel else "📋 SEQUENTIAL"
+        res_kind = "CPU" if is_cpu_machine_type(self.machine_type) else "GPU/TPU"
         await self.emit(
             "start",
-            f"🚀 Starting GPU/TPU scan for {self.vm_count}x {self.machine_type} ({mode_label} mode)",
+            f"🚀 Starting {res_kind} scan for {self.vm_count}x {self.machine_type} ({mode_label} mode)",
         )
 
         is_tpu = any(
             self.machine_type in tpu.get("machine_types", {})
             for tpu in TPU_TYPES.values()
         )
-        if self.machine_type not in MACHINE_TYPES and not is_tpu:
+        gce_info = get_gce_machine_info(self.machine_type)
+        if not gce_info and not is_tpu:
             self.status = ScanningStatus.FAILED
             await self.emit("error", f"❌ Unknown machine type: {self.machine_type}.")
             return
@@ -357,13 +412,21 @@ class ScanningSession:
             await self.emit("error", f"❌ Authentication failed: {str(e)}")
             return
 
-        family = MACHINE_TO_FAMILY.get(self.machine_type)
-        if family:
+        if gce_info and gce_info.get("category") == "CPU":
             await self.emit(
                 "info",
-                f"📋 Machine family: {family} | GPU: {MACHINE_TYPES[self.machine_type]['gpu']}",
+                f"📋 CPU Series: {gce_info['family']} ({gce_info['processor']}) | "
+                f"Shape: {self.machine_type} ({gce_info['vcpus']} vCPUs, {gce_info['memory_gb']} GB RAM, {gce_info['architecture']})",
+            )
+            family = gce_info["family"]
+        elif gce_info:
+            family = gce_info["family"]
+            await self.emit(
+                "info",
+                f"📋 Machine family: {family} | GPU: {gce_info['gpu']}",
             )
         else:
+            family = None
             tpu_spec = get_tpu_spec(self.machine_type, self.vm_count)
             tpu_desc = f"{tpu_spec['name']} ({tpu_spec['accelerator_type']})" if tpu_spec else "TPU"
             await self.emit("info", f"📋 Machine type: {self.machine_type} | {tpu_desc}")
@@ -718,7 +781,8 @@ class ScanningSession:
         short_id = self.session_id[:8]
         if prefix:
             return f"{prefix}-{method_tag}-{short_id}-{short_zone}"[:63]
-        return f"gpu-radar-{method_tag}-{short_id}-{short_zone}"[:63]
+        default_stem = "cpu-radar" if (self.sizing_mode == "vcpu_pool" or is_cpu_machine_type(self.machine_type)) else "gpu-radar"
+        return f"{default_stem}-{method_tag}-{short_id}-{short_zone}"[:63]
 
     async def _try_on_demand_rest(self, zone: str, name_prefix: str = "") -> bool:
         """Create on-demand reservation and poll operation to verify.
@@ -737,7 +801,7 @@ class ScanningSession:
             f"/zones/{zone}/reservations"
         )
         instance_props = {"machineType": self.machine_type}
-        machine_info = MACHINE_TYPES.get(self.machine_type, {})
+        machine_info = get_gce_machine_info(self.machine_type) or {}
         # Guest-attached GPUs (N1 / T4) must include bare acceleratorType name in reservation
         if machine_info.get("guest_attached_gpu") and machine_info.get("accelerator_type"):
             instance_props["guestAccelerators"] = [{
@@ -1055,16 +1119,20 @@ class ScanningSession:
         wait_secs: int = 0,
     ) -> dict:
         """Build a valid GCE instances.insert body for either SPOT or FLEX_START."""
-        machine_info = MACHINE_TYPES.get(self.machine_type, {})
+        machine_info = get_gce_machine_info(self.machine_type) or {}
         disk_type = machine_info.get("default_boot_disk_type", "pd-balanced")
         requires_hyperdisk = machine_info.get("requires_hyperdisk", False)
         requires_gvnic = machine_info.get("requires_gvnic", True)
+        source_image = machine_info.get(
+            "boot_image",
+            "projects/debian-cloud/global/images/family/debian-12",
+        )
 
         boot_disk = {
             "boot": True,
             "autoDelete": True,
             "initializeParams": {
-                "sourceImage": "projects/debian-cloud/global/images/family/debian-12",
+                "sourceImage": source_image,
                 "diskSizeGb": "100" if requires_hyperdisk else "50",
                 "diskType": f"zones/{zone}/diskTypes/{disk_type}",
             },
@@ -1285,10 +1353,11 @@ class ScanningSession:
         return sel
 
     async def _get_network(self, token: str, zone: str = "") -> str:
-        """Return the GPU VM networkInterfaces[].network selfLink-style path."""
-        if hasattr(self, "_cached_network"):
-            return self._cached_network
+        """Return the GCE VM networkInterfaces[].network selfLink-style path (cached per region)."""
         region = zone.rsplit("-", 1)[0] if zone else ""
+        cache_attr = f"_cached_network_{region}" if region else "_cached_network"
+        if hasattr(self, cache_attr):
+            return getattr(self, cache_attr)
         network_name = self.network
         if not network_name and region:
             sel = await self._resolve_network_selection(token, region)
@@ -1306,8 +1375,9 @@ class ScanningSession:
                         network_name = "default" if "default" in names else (names[0] if names else "default")
             except Exception:
                 network_name = "default"
-        self._cached_network = f"projects/{self.project}/global/networks/{network_name}"
-        return self._cached_network
+        net_path = f"projects/{self.project}/global/networks/{network_name}"
+        setattr(self, cache_attr, net_path)
+        return net_path
 
     async def _get_gpu_subnetwork(self, token: str, zone: str) -> Optional[str]:
         """Return the regional subnetwork path for GPU VMs, if resolvable."""
@@ -1775,6 +1845,715 @@ class ScanningSession:
             await self.emit("warning", f"⚠️ Timeout creating Spot TPU in {zone}")
             return False
 
+    # ── CPU Broad vCPU Pool Hunting Engine ─────────────────────────────
+
+    @staticmethod
+    def _interleave_zones_by_region(zones: list[str]) -> list[str]:
+        """Interleave zones round-robin across regions so multi-region scans sample diverse regions early."""
+        by_reg: dict[str, list[str]] = {}
+        for z in zones:
+            reg = z.rsplit("-", 1)[0]
+            by_reg.setdefault(reg, []).append(z)
+        ordered_regs = sorted(by_reg.keys(), key=lambda r: (-len(by_reg[r]), r))
+        interleaved: list[str] = []
+        idx = 0
+        while True:
+            added = False
+            for r in ordered_regs:
+                if idx < len(by_reg[r]):
+                    interleaved.append(by_reg[r][idx])
+                    added = True
+            if not added:
+                break
+            idx += 1
+        return interleaved
+
+    def _resolve_pool_zones(self, series: str, priority_zones: list[str]) -> list[str]:
+        """Resolve allowed zones for a CPU vCPU Pool priority, honoring series, region, and zone filters."""
+        supported = get_cpu_zones_for_series(series)
+        supported_set = set(supported)
+        if priority_zones:
+            filtered = [z for z in priority_zones if z in supported_set]
+        else:
+            filtered = list(supported)
+        if self.target_regions:
+            reg_set = set(self.target_regions)
+            filtered = [z for z in filtered if z.rsplit("-", 1)[0] in reg_set]
+        return filtered
+
+    @staticmethod
+    def _descending_count_steps(min_vms: int, max_vms: int) -> list[int]:
+        """Return up to 5 descending VM count steps between max_vms and min_vms (inclusive)."""
+        if min_vms >= max_vms:
+            return [max_vms]
+        span = max_vms - min_vms
+        if span <= 4:
+            return list(range(max_vms, min_vms - 1, -1))
+        steps: list[int] = []
+        for frac in (1.0, 0.75, 0.5, 0.25, 0.0):
+            val = max(min_vms, round(min_vms + span * frac))
+            if val not in steps:
+                steps.append(val)
+        return steps
+
+    async def _try_cpu_reservation_shard(
+        self,
+        zone: str,
+        machine_type: str,
+        vcpus_per_vm: int,
+        min_vms: int,
+        max_vms: int,
+        name_prefix: str = "",
+    ) -> Optional[dict]:
+        """Attempt to reserve between max_vms and min_vms of a CPU shape in a zone via On-Demand Reservation."""
+        token = await self._get_token()
+        url = (
+            f"https://compute.googleapis.com/compute/v1/projects/{self.project}"
+            f"/zones/{zone}/reservations"
+        )
+        headers = {"Authorization": f"Bearer {token}", "Content-Type": "application/json"}
+
+        for cand_vms in self._descending_count_steps(min_vms, max_vms):
+            if self.cancelled or self._is_hunting_expired():
+                return None
+            self._shard_counter += 1
+            res_name = self._make_name(name_prefix, f"od-s{self._shard_counter}", zone)
+            body = {
+                "name": res_name,
+                "specificReservation": {
+                    "count": str(cand_vms),
+                    "instanceProperties": {"machineType": machine_type},
+                },
+                "specificReservationRequired": True,
+            }
+            await self.emit(
+                "action",
+                f"📡 [On-Demand Pool] Trying {cand_vms}x {machine_type} ({cand_vms * vcpus_per_vm} vCPUs) "
+                f"reservation '{res_name}' in {zone}...",
+            )
+            try:
+                async with httpx.AsyncClient(timeout=60) as client:
+                    resp = await client.post(url, json=body, headers=headers)
+                    data = resp.json()
+                    if resp.status_code in (200, 201):
+                        self._last_completed_op = None
+                        verified = await self._wait_for_operation(data, zone, f"On-Demand {machine_type}")
+                        if verified:
+                            alloc_vcpus = cand_vms * vcpus_per_vm
+                            self._log_deployment_event(
+                                "on_demand",
+                                zone,
+                                res_name,
+                                True,
+                                "reservation",
+                                {"machine_type": machine_type, "vm_count": cand_vms, "vcpus": alloc_vcpus},
+                            )
+                            return {
+                                "method": "on_demand",
+                                "resource_type": "reservation",
+                                "resource_name": res_name,
+                                "reservation_name": res_name,
+                                "zone": zone,
+                                "region": zone.rsplit("-", 1)[0],
+                                "machine_type": machine_type,
+                                "vm_count": cand_vms,
+                                "vcpus_per_vm": vcpus_per_vm,
+                                "vcpus": alloc_vcpus,
+                            }
+                    else:
+                        err_msg = self._parse_api_error(data)
+                        await self.emit("warning", f"⚠️ [On-Demand Pool] {zone} ({cand_vms}x {machine_type}): {err_msg}")
+                        # Non-capacity errors (quota/auth/not in zone) won't succeed at smaller counts of same shape
+                        if "no capacity" not in err_msg.lower() and "stock" not in err_msg.lower():
+                            return None
+            except httpx.TimeoutException:
+                await self.emit("warning", f"⚠️ Timeout creating reservation in {zone}")
+                return None
+        return None
+
+    async def _try_cpu_bulk_insert_rest(
+        self,
+        zone: str,
+        machine_type: str,
+        vcpus_per_vm: int,
+        min_vms: int,
+        max_vms: int,
+        provisioning_model: str,
+        name_prefix: str = "",
+        flex_max_wait_hours: int = 168,
+        flex_usage_duration_hours: int = 24,
+    ) -> Optional[dict]:
+        """Atomically create between min_vms and max_vms CPU instances in a zone using GCE instances.bulkInsert."""
+        token = await self._get_token()
+        network = await self._get_network(token, zone)
+        subnetwork = await self._get_gpu_subnetwork(token, zone)
+
+        machine_info = get_gce_machine_info(machine_type) or {}
+        disk_type = machine_info.get("default_boot_disk_type", "pd-balanced")
+        requires_hyperdisk = machine_info.get("requires_hyperdisk", False)
+        requires_gvnic = machine_info.get("requires_gvnic", True)
+        source_image = machine_info.get(
+            "boot_image",
+            "projects/debian-cloud/global/images/family/debian-12",
+        )
+
+        self._shard_counter += 1
+        shard_tag = f"s{self._shard_counter}"
+        method_key = "dws_flex" if provisioning_model == "FLEX_START" else "spot"
+        method_short = "flex" if provisioning_model == "FLEX_START" else "spot"
+
+        raw_base = self._make_name(name_prefix, f"{method_short}-{shard_tag}", zone)[:57].rstrip("-")
+        if not raw_base or not raw_base[0].isalpha():
+            raw_base = f"cr-{raw_base}"[:57].rstrip("-")
+        name_pattern = f"{raw_base}-####"
+
+        boot_disk = {
+            "boot": True,
+            "autoDelete": True,
+            "type": "PERSISTENT",
+            "mode": "READ_WRITE",
+            "initializeParams": {
+                "sourceImage": source_image,
+                "diskSizeGb": "100" if requires_hyperdisk else "50",
+                "diskType": disk_type,  # bare diskType name required by bulkInsert InstanceProperties
+            },
+        }
+        if requires_gvnic:
+            boot_disk["guestOsFeatures"] = [{"type": "GVNIC"}]
+
+        net_iface = {
+            "network": network,
+            **({"subnetwork": subnetwork} if subnetwork else {}),
+            **({"nicType": "GVNIC"} if requires_gvnic else {}),
+            "accessConfigs": [{"type": "ONE_TO_ONE_NAT", "name": "External NAT"}],
+        }
+
+        scheduling = {
+            "provisioningModel": provisioning_model,
+            "instanceTerminationAction": "DELETE",
+            "automaticRestart": False,
+            "onHostMaintenance": "TERMINATE",
+        }
+        if provisioning_model == "FLEX_START":
+            max_run_secs = min(604800, max(600, int(flex_usage_duration_hours) * 3600))
+            scheduling["maxRunDuration"] = {"seconds": str(max_run_secs)}
+
+        labels = {
+            "created-by": "capacity-radar",
+            "capacity-radar-session": self.session_id[:8],
+            "capacity-radar-method": method_key.replace("_", "-"),
+            "capacity-radar-machine": machine_type[:63].replace(".", "-"),
+            "capacity-radar-shard": f"{self.session_id[:8]}-{shard_tag}",
+            "capacity-radar-project": self.project[:63].replace(".", "-"),
+        }
+
+        body = {
+            "count": max_vms,
+            "minCount": min_vms,
+            "namePattern": name_pattern,
+            "instanceProperties": {
+                "machineType": machine_type,  # bare machineType name required by bulkInsert InstanceProperties
+                "scheduling": scheduling,
+                "disks": [boot_disk],
+                "networkInterfaces": [net_iface],
+                "labels": labels,
+            },
+        }
+        if provisioning_model == "FLEX_START":
+            wait_secs = min(604800, max(600, int(flex_max_wait_hours) * 3600))
+            body["requestValidForDuration"] = {"seconds": str(wait_secs)}
+
+        range_str = f"{min_vms}..{max_vms}" if min_vms != max_vms else str(max_vms)
+        await self.emit(
+            "action",
+            f"📡 [{CONSUMPTION_LABELS[ConsumptionModel(method_key)]}] Bulk-creating {range_str}x {machine_type} "
+            f"({min_vms * vcpus_per_vm}–{max_vms * vcpus_per_vm} vCPUs) in {zone}...",
+        )
+
+        url = (
+            f"https://compute.googleapis.com/compute/v1/projects/{self.project}"
+            f"/zones/{zone}/instances/bulkInsert"
+        )
+        headers = {"Authorization": f"Bearer {token}", "Content-Type": "application/json"}
+
+        try:
+            async with httpx.AsyncClient(timeout=120) as client:
+                resp = await client.post(url, json=body, headers=headers)
+                data = resp.json()
+                if resp.status_code in (200, 201):
+                    self._last_completed_op = None
+                    verified = await self._wait_for_operation(
+                        data, zone, f"Bulk {method_short.upper()} {machine_type}", max_polls=60, poll_interval=5
+                    )
+                    if not verified:
+                        return None
+
+                    op = self._last_completed_op or data
+                    meta = (
+                        op.get("instancesBulkInsertOperationMetadata")
+                        or op.get("instances_bulk_insert_operation_metadata")
+                        or {}
+                    )
+                    per_loc = meta.get("perLocationStatus") or meta.get("per_location_status") or {}
+                    created_vms = 0
+                    for _loc_k, loc_v in per_loc.items():
+                        created_vms += int(
+                            loc_v.get("createdVmCount") or loc_v.get("created_vm_count") or 0
+                        )
+                    if created_vms <= 0:
+                        created_vms = max_vms
+                    if created_vms < min_vms:
+                        return None
+
+                    alloc_vcpus = created_vms * vcpus_per_vm
+                    self._log_deployment_event(
+                        method_key,
+                        zone,
+                        name_pattern,
+                        True,
+                        "bulk_instances",
+                        {"machine_type": machine_type, "vm_count": created_vms, "vcpus": alloc_vcpus},
+                    )
+                    return {
+                        "method": method_key,
+                        "resource_type": "bulk_instances",
+                        "resource_name": name_pattern,
+                        "name_pattern": name_pattern,
+                        "shard_label": labels["capacity-radar-shard"],
+                        "zone": zone,
+                        "region": zone.rsplit("-", 1)[0],
+                        "machine_type": machine_type,
+                        "vm_count": created_vms,
+                        "vcpus_per_vm": vcpus_per_vm,
+                        "vcpus": alloc_vcpus,
+                    }
+                else:
+                    err_msg = self._parse_api_error(data)
+                    await self.emit("warning", f"⚠️ [Bulk {method_short.upper()}] {zone} ({machine_type}): {err_msg}")
+                    return None
+        except httpx.TimeoutException:
+            await self.emit("warning", f"⚠️ Timeout during bulkInsert in {zone}")
+            return None
+
+    async def _rollback_shards(self, shards: list[dict]):
+        """Cleanly delete partial reservations or bulk-created instances when a scoped region/pool fails."""
+        if not shards:
+            return
+        token = await self._get_token()
+        headers = {"Authorization": f"Bearer {token}"}
+        async with httpx.AsyncClient(timeout=30) as client:
+            for shard in shards:
+                zone = shard["zone"]
+                rtype = shard.get("resource_type")
+                try:
+                    if rtype == "reservation":
+                        rname = shard["reservation_name"]
+                        del_url = (
+                            f"https://compute.googleapis.com/compute/v1/projects/{self.project}"
+                            f"/zones/{zone}/reservations/{rname}"
+                        )
+                        await client.delete(del_url, headers=headers)
+                        await self.emit("info", f"🧹 Rolled back partial reservation '{rname}' in {zone}.")
+                    elif rtype == "bulk_instances":
+                        slabel = shard.get("shard_label", "")
+                        list_url = (
+                            f"https://compute.googleapis.com/compute/v1/projects/{self.project}"
+                            f"/zones/{zone}/instances"
+                        )
+                        params = {"filter": f'labels.capacity-radar-shard="{slabel}"'}
+                        lresp = await client.get(list_url, headers=headers, params=params)
+                        items = lresp.json().get("items", []) if lresp.status_code == 200 else []
+                        for inst in items:
+                            iname = inst.get("name")
+                            if iname:
+                                await client.delete(f"{list_url}/{iname}", headers=headers)
+                        await self.emit(
+                            "info",
+                            f"🧹 Rolled back {len(items) or shard.get('vm_count', 0)} partial VM(s) "
+                            f"({shard.get('name_pattern')}) in {zone}.",
+                        )
+                except Exception as e:
+                    await self.emit("warning", f"⚠️ Rollback warning in {zone}: {str(e)[:120]}")
+
+    async def _try_pool_zone_allocation(
+        self,
+        method: str,
+        zone: str,
+        candidates: list[dict],
+        remaining_vcpus: int,
+        min_cluster_vcpus: int,
+        placement_scope: str,
+        name_prefix: str = "",
+        flex_max_wait_hours: int = 168,
+        flex_usage_duration_hours: int = 24,
+    ) -> Optional[dict]:
+        """Walk the CPU shape ladder in a single zone to acquire a shard >= min_cluster_vcpus."""
+        for shape in candidates:
+            if self.cancelled or self._is_hunting_expired():
+                return None
+            mt = shape["machine_type"]
+            v = shape["vcpus"]
+            if not is_consumption_supported(mt, method):
+                continue
+
+            min_vms, max_vms = compute_pool_chunk_bounds(
+                remaining_vcpus=remaining_vcpus,
+                min_cluster_vcpus=min_cluster_vcpus,
+                shape_vcpus=v,
+                placement_scope=placement_scope,
+            )
+
+            await self.emit(
+                "attempt",
+                f"🔄 [{CONSUMPTION_LABELS.get(method, method)}] Probing {zone} — {mt} "
+                f"({min_vms}..{max_vms} VMs, {min_vms * v}–{max_vms * v} vCPUs)",
+                {"zone": zone, "method": method, "machineType": mt, "minVms": min_vms, "maxVms": max_vms},
+            )
+
+            await self._refresh_token()
+            if method == ConsumptionModel.ON_DEMAND:
+                shard = await self._try_cpu_reservation_shard(
+                    zone=zone,
+                    machine_type=mt,
+                    vcpus_per_vm=v,
+                    min_vms=min_vms,
+                    max_vms=max_vms,
+                    name_prefix=name_prefix,
+                )
+            elif method == ConsumptionModel.SPOT:
+                shard = await self._try_cpu_bulk_insert_rest(
+                    zone=zone,
+                    machine_type=mt,
+                    vcpus_per_vm=v,
+                    min_vms=min_vms,
+                    max_vms=max_vms,
+                    provisioning_model="SPOT",
+                    name_prefix=name_prefix,
+                )
+            elif method == ConsumptionModel.DWS_FLEX:
+                shard = await self._try_cpu_bulk_insert_rest(
+                    zone=zone,
+                    machine_type=mt,
+                    vcpus_per_vm=v,
+                    min_vms=min_vms,
+                    max_vms=max_vms,
+                    provisioning_model="FLEX_START",
+                    name_prefix=name_prefix,
+                    flex_max_wait_hours=flex_max_wait_hours,
+                    flex_usage_duration_hours=flex_usage_duration_hours,
+                )
+            else:
+                shard = None
+
+            if shard:
+                return shard
+        return None
+
+    async def _run_cpu_vcpu_pool(self, parallel: bool = False):
+        """Execute broad CPU vCPU Pool hunting across single_zone, single_region, or multi_region scopes."""
+        series = normalize_cpu_series(self.cpu_family)
+        if not series and is_cpu_machine_type(self.machine_type):
+            series = CPU_MACHINE_TYPES[self.machine_type]["chip"]
+        if not series:
+            self.status = ScanningStatus.FAILED
+            await self.emit("error", f"❌ Unknown CPU series: '{self.cpu_family}'.")
+            return
+
+        self.cpu_family = series
+        sinfo = CPU_SERIES[series]
+        candidates = get_cpu_candidate_shapes(
+            series=series,
+            shape_class=self.shape_class,
+            target_vcpus=self.target_vcpus,
+        )
+        if not candidates:
+            self.status = ScanningStatus.FAILED
+            await self.emit("error", f"❌ No valid VM shapes found for CPU series {series}.")
+            return
+
+        scope_labels = {
+            "single_zone": "Single Zone (all vCPUs in 1 zone)",
+            "single_region": f"Single Region (all vCPUs in 1 region, min {self.min_cluster_vcpus} vCPUs/zone)",
+            "multi_region": f"Multi-Region / Multi-Zone (min local cluster: {self.min_cluster_vcpus} vCPUs)",
+        }
+        mode_label = "⚡ PARALLEL" if parallel else "📋 SEQUENTIAL"
+        await self.emit(
+            "start",
+            f"🚀 Starting CPU vCPU Pool scan for {self.target_vcpus} {series} vCPUs "
+            f"[{scope_labels[self.placement_scope]}] ({mode_label} mode)",
+        )
+
+        try:
+            await self._get_token()
+            await self.emit("info", "🔑 Authentication successful")
+        except Exception as e:
+            self.status = ScanningStatus.FAILED
+            await self.emit("error", f"❌ Authentication failed: {str(e)}")
+            return
+
+        shape_names = ", ".join(f"{c['machine_type']} ({c['vcpus']}v)" for c in candidates[:6])
+        await self.emit(
+            "info",
+            f"📋 CPU Series: {series} ({sinfo['processor']}, {sinfo['architecture']}) | "
+            f"Shape ladder: {shape_names}",
+        )
+
+        pool_lock = asyncio.Lock()
+        global_shards: list[dict] = []
+
+        async def run_priority_pool(priority_idx: int, priority: dict) -> bool:
+            method = priority["method"]
+            method_label = CONSUMPTION_LABELS.get(method, method)
+            max_retries = priority.get("max_retries", 5)
+            retry_interval = priority.get("retry_interval", 60)
+            name_prefix = priority.get("name_prefix", "")
+            flex_max_wait = priority.get("flex_max_wait_hours", 168)
+            flex_usage_dur = priority.get("flex_usage_duration_hours", 24)
+
+            if not sinfo["supported"].get(method, False):
+                await self.emit(
+                    "warning",
+                    f"⚠️ {method_label} is NOT supported for CPU series {series}. Skipping.",
+                )
+                return False
+
+            valid_zones = self._resolve_pool_zones(series, priority.get("zones", []))
+            if not valid_zones:
+                await self.emit("warning", f"⚠️ No valid {series} zones match filter for {method_label}. Skipping.")
+                return False
+
+            await self.emit(
+                "priority_start",
+                f"📌 Priority {priority_idx + 1}/{len(self.priorities)}: Hunting {self.target_vcpus} {series} vCPUs "
+                f"via {method_label} across {len(valid_zones)} zone(s)",
+                {"priority": priority_idx + 1, "method": method, "zonesCount": len(valid_zones)},
+            )
+
+            for attempt in range(1, max_retries + 1):
+                if self.cancelled or self._is_hunting_expired():
+                    break
+
+                if self.placement_scope == "single_zone":
+                    ordered_zones = self._interleave_zones_by_region(valid_zones)
+                    for zone in ordered_zones:
+                        if self.cancelled or self._is_hunting_expired():
+                            return False
+                        async with pool_lock:
+                            if sum(s["vcpus"] for s in global_shards) >= self.target_vcpus:
+                                return True
+                        shard = await self._try_pool_zone_allocation(
+                            method=method,
+                            zone=zone,
+                            candidates=candidates,
+                            remaining_vcpus=self.min_total_vcpus if self.min_total_vcpus < self.target_vcpus else self.target_vcpus,
+                            min_cluster_vcpus=self.min_total_vcpus,
+                            placement_scope="single_zone",
+                            name_prefix=name_prefix,
+                            flex_max_wait_hours=flex_max_wait,
+                            flex_usage_duration_hours=flex_usage_dur,
+                        )
+                        if shard:
+                            async with pool_lock:
+                                if sum(s["vcpus"] for s in global_shards) >= self.target_vcpus:
+                                    await self._rollback_shards([shard])
+                                    return True
+                                global_shards.append(shard)
+                                await self.emit(
+                                    "info",
+                                    f"🎯 Secured {shard['vcpus']} {series} vCPUs "
+                                    f"({shard['vm_count']}x {shard['machine_type']}) in single zone {zone}!",
+                                )
+                                return True
+
+                elif self.placement_scope == "single_region":
+                    by_reg: dict[str, list[str]] = {}
+                    for z in valid_zones:
+                        by_reg.setdefault(z.rsplit("-", 1)[0], []).append(z)
+                    ordered_regs = sorted(by_reg.items(), key=lambda kv: (-len(kv[1]), kv[0]))
+
+                    for reg, r_zones in ordered_regs:
+                        if self.cancelled or self._is_hunting_expired():
+                            return False
+                        async with pool_lock:
+                            if sum(s["vcpus"] for s in global_shards) >= self.target_vcpus:
+                                return True
+
+                        region_shards: list[dict] = []
+                        region_vcpus = 0
+                        await self.emit(
+                            "info",
+                            f"🌐 [Single-Region] Trying region {reg} ({len(r_zones)} zone(s): {', '.join(r_zones)})...",
+                        )
+                        for zone in r_zones:
+                            if self.cancelled or self._is_hunting_expired():
+                                break
+                            remaining = self.target_vcpus - region_vcpus
+                            if remaining <= 0:
+                                break
+                            zone_cands = get_cpu_candidate_shapes(
+                                series=series,
+                                shape_class=self.shape_class,
+                                target_vcpus=max(remaining, self.min_cluster_vcpus),
+                            )
+                            shard = await self._try_pool_zone_allocation(
+                                method=method,
+                                zone=zone,
+                                candidates=zone_cands or candidates,
+                                remaining_vcpus=remaining,
+                                min_cluster_vcpus=self.min_cluster_vcpus,
+                                placement_scope="single_region",
+                                name_prefix=name_prefix,
+                                flex_max_wait_hours=flex_max_wait,
+                                flex_usage_duration_hours=flex_usage_dur,
+                            )
+                            if shard:
+                                region_shards.append(shard)
+                                region_vcpus += shard["vcpus"]
+                                await self.emit(
+                                    "info",
+                                    f"🎯 [Region {reg}] Secured {shard['vcpus']} vCPUs "
+                                    f"({shard['vm_count']}x {shard['machine_type']}) in {zone} "
+                                    f"— Regional total: {region_vcpus}/{self.target_vcpus} vCPUs",
+                                )
+                                if region_vcpus >= self.target_vcpus:
+                                    break
+
+                        if region_vcpus >= self.min_total_vcpus:
+                            async with pool_lock:
+                                if sum(s["vcpus"] for s in global_shards) >= self.target_vcpus:
+                                    await self._rollback_shards(region_shards)
+                                    return True
+                                global_shards.extend(region_shards)
+                                return True
+                        elif region_shards:
+                            await self.emit(
+                                "warning",
+                                f"🧹 Region {reg} provided {region_vcpus}/{self.min_total_vcpus} vCPUs "
+                                f"— rolling back {len(region_shards)} partial shard(s) before trying next region...",
+                            )
+                            await self._rollback_shards(region_shards)
+
+                else:
+                    # multi_region: accumulate shards >= min_cluster_vcpus across regions & zones
+                    ordered_zones = self._interleave_zones_by_region(valid_zones)
+                    for zone in ordered_zones:
+                        if self.cancelled or self._is_hunting_expired():
+                            break
+                        async with pool_lock:
+                            cur_total = sum(s["vcpus"] for s in global_shards)
+                            if cur_total >= self.target_vcpus:
+                                return True
+                            remaining = self.target_vcpus - cur_total
+
+                        zone_cands = get_cpu_candidate_shapes(
+                            series=series,
+                            shape_class=self.shape_class,
+                            target_vcpus=max(remaining, self.min_cluster_vcpus),
+                        )
+                        shard = await self._try_pool_zone_allocation(
+                            method=method,
+                            zone=zone,
+                            candidates=zone_cands or candidates,
+                            remaining_vcpus=remaining,
+                            min_cluster_vcpus=self.min_cluster_vcpus,
+                            placement_scope="multi_region",
+                            name_prefix=name_prefix,
+                            flex_max_wait_hours=flex_max_wait,
+                            flex_usage_duration_hours=flex_usage_dur,
+                        )
+                        if shard:
+                            async with pool_lock:
+                                cur_total = sum(s["vcpus"] for s in global_shards)
+                                if cur_total >= self.target_vcpus:
+                                    await self._rollback_shards([shard])
+                                    return True
+                                global_shards.append(shard)
+                                new_total = cur_total + shard["vcpus"]
+                                await self.emit(
+                                    "info",
+                                    f"🎯 Secured shard #{len(global_shards)}: {shard['vcpus']} vCPUs "
+                                    f"({shard['vm_count']}x {shard['machine_type']}) in {zone} "
+                                    f"— Pool total: {new_total}/{self.target_vcpus} vCPUs",
+                                )
+                                if new_total >= self.target_vcpus:
+                                    return True
+
+                async with pool_lock:
+                    if sum(s["vcpus"] for s in global_shards) >= self.target_vcpus:
+                        return True
+
+                if attempt < max_retries and not self.cancelled and not self._is_hunting_expired():
+                    await self.emit(
+                        "waiting",
+                        f"⏳ [{method_label}] Waiting {retry_interval}s before round {attempt + 1}/{max_retries}...",
+                    )
+                    for _ in range(retry_interval):
+                        if self.cancelled or self._is_hunting_expired():
+                            break
+                        await asyncio.sleep(1)
+
+            return sum(s["vcpus"] for s in global_shards) >= self.min_total_vcpus
+
+        if parallel:
+            await asyncio.gather(
+                *[run_priority_pool(idx, p) for idx, p in enumerate(self.priorities)],
+                return_exceptions=True,
+            )
+        else:
+            for idx, p in enumerate(self.priorities):
+                if self.cancelled or self._is_hunting_expired():
+                    break
+                if await run_priority_pool(idx, p):
+                    if sum(s["vcpus"] for s in global_shards) >= self.target_vcpus:
+                        break
+
+        total_secured_vcpus = sum(s["vcpus"] for s in global_shards)
+        total_secured_vms = sum(s["vm_count"] for s in global_shards)
+        regions_used = sorted({s["region"] for s in global_shards})
+        zones_used = sorted({s["zone"] for s in global_shards})
+
+        if self.cancelled:
+            self.status = ScanningStatus.CANCELLED
+            await self.emit("cancelled", "🛑 CPU vCPU Pool scan cancelled by user.")
+            _schedule_session_cleanup(self.session_id)
+            return
+
+        if total_secured_vcpus >= self.min_total_vcpus:
+            self.status = ScanningStatus.SUCCESS
+            self.result = {
+                "sizing_mode": "vcpu_pool",
+                "cpu_family": series,
+                "placement_scope": self.placement_scope,
+                "min_cluster_vcpus": self.min_cluster_vcpus,
+                "target_vcpus": self.target_vcpus,
+                "total_vcpus": total_secured_vcpus,
+                "vm_count": total_secured_vms,
+                "regions": regions_used,
+                "zones": zones_used,
+                "shards": global_shards,
+            }
+            await self.emit(
+                "success",
+                f"✅ CPU Pool secured! Grabbed {total_secured_vcpus} {series} vCPUs "
+                f"({total_secured_vms} VMs across {len(zones_used)} zone(s) in {len(regions_used)} region(s)).",
+                {"result": self.result},
+            )
+        else:
+            if global_shards:
+                await self.emit(
+                    "warning",
+                    f"🧹 Pool reached {total_secured_vcpus}/{self.min_total_vcpus} minimum required vCPUs — "
+                    f"rolling back {len(global_shards)} partial shard(s)...",
+                )
+                await self._rollback_shards(global_shards)
+            self.status = ScanningStatus.FAILED
+            await self.emit(
+                "failed",
+                f"❌ CPU Pool scan exhausted. Could not secure {self.min_total_vcpus} {series} vCPUs "
+                f"under {self.placement_scope} constraints.",
+            )
+        _schedule_session_cleanup(self.session_id)
+
     def _parse_api_error(self, data: dict) -> str:
         error = data.get("error", {})
         message = error.get("message", "")
@@ -1784,16 +2563,23 @@ class ScanningSession:
         if not message and errors:
             message = errors[0].get("message", "Unknown error")
         ml = message.lower()
-        if code == 403:
+        if "flex_start_general_purpose_not_enabled" in ml or "flex-start provisioning model" in ml:
+            return "CPU DWS Flex Start is not enabled for this project (Preview allowlist required)."
+        elif (
+            "zone does not have enough resources" in ml
+            or "sufficient capacity" in ml
+            or "zone_resource_pool_exhausted" in ml
+            or "stockout" in ml
+        ):
+            return "No capacity — zone out of stock."
+        elif "quota" in ml:
+            return f"Quota exceeded. ({message[:150]})"
+        elif code == 403:
             return f"Permission denied ({code}). Check IAM permissions."
         elif code == 404:
             return f"Not found ({code}). Resource or API doesn't exist."
         elif code == 409:
             return f"Conflict ({code}). Resource may already exist."
-        elif "quota" in ml:
-            return f"Quota exceeded. ({message[:150]})"
-        elif "zone does not have enough resources" in ml or "stockout" in ml:
-            return "No capacity — zone out of stock."
         elif "not found" in ml and "machine" in ml:
             return f"Machine type '{self.machine_type}' not in this zone."
         elif "billing" in ml:
@@ -1832,6 +2618,14 @@ def create_session(
     min_vm_count=None,
     max_vm_count=None,
     total_hunting_hours=1.0,
+    sizing_mode="exact_shape",
+    cpu_family="",
+    target_vcpus=0,
+    min_total_vcpus=None,
+    placement_scope="multi_region",
+    min_cluster_vcpus=30,
+    shape_class="any",
+    target_regions=None,
 ) -> ScanningSession:
     session_id = str(uuid.uuid4())
     session = ScanningSession(
@@ -1848,6 +2642,14 @@ def create_session(
         min_vm_count=min_vm_count,
         max_vm_count=max_vm_count,
         total_hunting_hours=total_hunting_hours,
+        sizing_mode=sizing_mode,
+        cpu_family=cpu_family,
+        target_vcpus=target_vcpus,
+        min_total_vcpus=min_total_vcpus,
+        placement_scope=placement_scope,
+        min_cluster_vcpus=min_cluster_vcpus,
+        shape_class=shape_class,
+        target_regions=target_regions,
     )
     active_sessions[session_id] = session
     return session

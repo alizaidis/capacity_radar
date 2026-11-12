@@ -563,7 +563,7 @@ export default function App() {
           {/* Footer */}
           <Box sx={{ p: 1.5, borderTop: 1, borderColor: 'divider' }}>
             <Typography variant="caption" color="text.secondary" sx={{ fontSize: '0.65rem', display: 'block', textAlign: 'center' }}>
-              Capacity Radar &mdash; GPU/TPU Capacity Hunting Tool
+              Capacity Radar &mdash; GPU / TPU / CPU Capacity Hunting Tool
             </Typography>
           </Box>
         </Drawer>

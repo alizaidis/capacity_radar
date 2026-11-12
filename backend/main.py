@@ -16,13 +16,21 @@ from pydantic import BaseModel, Field
 
 from gpu_data import (
     get_all_machine_types_info,
+    get_gce_machine_info,
     get_zones_for_machine_type,
     get_calendar_zones_for_machine_type,
     MACHINE_TYPES,
     get_chip_groups,
     TPU_TYPES,
 )
-from advisory import get_calendar_advisory, get_spot_advisory, find_best_splits, get_flex_advisory
+from cpu_data import CPU_SERIES, normalize_cpu_series
+from advisory import (
+    get_calendar_advisory,
+    get_spot_advisory,
+    find_best_splits,
+    get_flex_advisory,
+    get_cpu_pool_advisory,
+)
 from hunter import (
     create_session, cancel_session, get_session,
     active_sessions, ConsumptionModel, ScanningStatus,
@@ -96,9 +104,9 @@ def _require_user_token(user_token: Optional[str]):
         )
 
 app = FastAPI(
-    title="GPU Radar",
-    description="Priority-based GPU capacity hunting tool for Google Cloud",
-    version="1.0.0",
+    title="Capacity Radar",
+    description="Priority-based GPU, TPU, and CPU capacity hunting tool for Google Cloud",
+    version="1.1.0",
 )
 
 # CORS for frontend dev server
@@ -144,9 +152,20 @@ class FlexAdvisoryRequest(BaseModel):
     zones: list[str] = []
 
 
+class CpuPoolAdvisoryRequest(BaseModel):
+    project: str
+    cpuFamily: str
+    targetVcpus: int = Field(default=500, ge=1)
+    placementScope: str = "multi_region"  # single_zone | single_region | multi_region
+    minClusterVcpus: int = Field(default=30, ge=1)
+    shapeClass: str = "any"               # any | standard | highcpu | highmem
+    regions: list[str] = []
+    zones: list[str] = []
+
+
 class PriorityConfig(BaseModel):
     method: str  # on_demand, dws_calendar, dws_flex, spot
-    zones: list[str]
+    zones: list[str] = []
     max_retries: int = Field(default=5, ge=1, le=100)
     retry_interval: int = Field(default=60, ge=10, le=3600)
     name_prefix: str = Field(default="", max_length=50)
@@ -158,7 +177,7 @@ class PriorityConfig(BaseModel):
 
 class ScanRequest(BaseModel):
     project: str
-    machineType: str
+    machineType: str = ""
     vmCount: int = Field(default=1, ge=1)
     minVmCount: int = Field(default=1, ge=1)
     maxVmCount: int = Field(default=1, ge=1)
@@ -167,6 +186,15 @@ class ScanRequest(BaseModel):
     dwsCalendarDurationHours: int = Field(default=24, ge=1, le=2160)  # Max 90 days
     network: str = Field(default="")      # VPC network name (empty = auto-select)
     subnetwork: str = Field(default="")   # Regional subnetwork name (optional)
+    # CPU Broad vCPU Pool fields
+    sizingMode: str = Field(default="exact_shape")  # exact_shape | vcpu_pool
+    cpuFamily: str = Field(default="")              # e.g. C4A, C4, C4D, C3, N4
+    targetVcpus: int = Field(default=500, ge=1)
+    minTotalVcpus: Optional[int] = Field(default=None, ge=1)
+    placementScope: str = Field(default="multi_region")  # single_zone | single_region | multi_region
+    minClusterVcpus: int = Field(default=30, ge=1)
+    shapeClass: str = Field(default="any")               # any | standard | highcpu | highmem
+    targetRegions: list[str] = []
 
 
 class CreateNetworkRequest(BaseModel):
@@ -368,6 +396,27 @@ async def list_chip_groups():
     return get_chip_groups()
 
 
+@app.get("/api/cpu-families")
+async def list_cpu_families():
+    """Get all supported CPU series with processor, architecture, zones, regions, and shape specs."""
+    families = []
+    for key, sinfo in CPU_SERIES.items():
+        zones = sinfo["zones"]
+        families.append({
+            "series": key,
+            "processor": sinfo["processor"],
+            "architecture": sinfo["architecture"],
+            "zones": zones,
+            "regions": sorted(set(z.rsplit("-", 1)[0] for z in zones)),
+            "supported": sinfo["supported"],
+            "shapes": [
+                {"machineType": mt, **spec}
+                for mt, spec in sinfo["shapes"].items()
+            ],
+        })
+    return {"cpuFamilies": families}
+
+
 @app.get("/api/machine-types/{machine_type}/zones")
 async def list_zones_for_machine_type(machine_type: str):
     """Get supported zones for a specific machine type."""
@@ -517,6 +566,33 @@ async def flex_advisory(req: FlexAdvisoryRequest, request: Request):
         raise HTTPException(status_code=500, detail=str(e))
 
 
+@app.post("/api/advisory/cpu-pool")
+async def cpu_pool_advisory(req: CpuPoolAdvisoryRequest, request: Request):
+    """Query GCE Capacity Advisory and build an optimal CPU vCPU pool shard plan."""
+    user_token = _bearer_token(request)
+    _require_user_token(user_token)
+    if not normalize_cpu_series(req.cpuFamily):
+        raise HTTPException(status_code=400, detail=f"Unknown CPU series '{req.cpuFamily}'")
+    try:
+        result = await get_cpu_pool_advisory(
+            user_token=user_token,
+            project=req.project,
+            cpu_family=req.cpuFamily,
+            target_vcpus=req.targetVcpus,
+            placement_scope=req.placementScope,
+            min_cluster_vcpus=req.minClusterVcpus,
+            shape_class=req.shapeClass,
+            regions=req.regions if req.regions else None,
+            zones=req.zones if req.zones else None,
+        )
+        return result
+    except ValueError as e:
+        raise HTTPException(status_code=400, detail=str(e))
+    except Exception as e:
+        logger.error(f"CPU pool advisory error: {e}")
+        raise HTTPException(status_code=500, detail=str(e))
+
+
 @app.post("/api/scan/cancel/{session_id}")
 async def cancel_scan(session_id: str):
     """Cancel an active scanning session."""
@@ -601,15 +677,24 @@ async def websocket_scan(websocket: WebSocket):
                     })
                     continue
 
-                # Validate machine type (GPU or TPU)
-                is_valid_tpu = any(scan_req.machineType in t.get("machine_types", {})
-                                   for t in TPU_TYPES.values())
-                if scan_req.machineType not in MACHINE_TYPES and not is_valid_tpu:
-                    await websocket.send_json({
-                        "type": "error",
-                        "message": f"Unknown machine type: {scan_req.machineType}",
-                    })
-                    continue
+                # Validate machine type (GPU/TPU/CPU exact_shape) or CPU series (vcpu_pool)
+                if scan_req.sizingMode == "vcpu_pool":
+                    norm_series = normalize_cpu_series(scan_req.cpuFamily)
+                    if not norm_series:
+                        await websocket.send_json({
+                            "type": "error",
+                            "message": f"Unknown CPU series for vCPU Pool: '{scan_req.cpuFamily}'",
+                        })
+                        continue
+                else:
+                    is_valid_tpu = any(scan_req.machineType in t.get("machine_types", {})
+                                       for t in TPU_TYPES.values())
+                    if not get_gce_machine_info(scan_req.machineType) and not is_valid_tpu:
+                        await websocket.send_json({
+                            "type": "error",
+                            "message": f"Unknown machine type: {scan_req.machineType}",
+                        })
+                        continue
 
                 # Build priorities list
                 priorities = []
@@ -647,6 +732,14 @@ async def websocket_scan(websocket: WebSocket):
                     min_vm_count=scan_req.minVmCount,
                     max_vm_count=scan_req.maxVmCount,
                     total_hunting_hours=scan_req.totalHuntingHours,
+                    sizing_mode=scan_req.sizingMode,
+                    cpu_family=scan_req.cpuFamily,
+                    target_vcpus=scan_req.targetVcpus,
+                    min_total_vcpus=scan_req.minTotalVcpus,
+                    placement_scope=scan_req.placementScope,
+                    min_cluster_vcpus=scan_req.minClusterVcpus,
+                    shape_class=scan_req.shapeClass,
+                    target_regions=scan_req.targetRegions,
                 )
 
 
@@ -659,19 +752,24 @@ async def websocket_scan(websocket: WebSocket):
                     "message": f"Session created: {session.session_id}",
                 })
 
-                # DEMO MODE: Block actual GPU deployment
+                # DEMO MODE: Block actual deployment
                 if DEMO_MODE:
                     from datetime import datetime, timezone as tz
                     ts = datetime.now(tz.utc).isoformat()
                     methods_str = ", ".join(p["method"] for p in priorities)
-                    zones_str = ", ".join(priorities[0]["zones"][:3]) if priorities and priorities[0].get("zones") else "N/A"
-                    if len(priorities[0].get("zones", [])) > 3:
+                    zones_str = ", ".join(priorities[0]["zones"][:3]) if priorities and priorities[0].get("zones") else "Anywhere"
+                    if priorities and len(priorities[0].get("zones", [])) > 3:
                         zones_str += "..."
+                    target_desc = (
+                        f"{scan_req.targetVcpus} {scan_req.cpuFamily.upper()} vCPUs ({scan_req.placementScope})"
+                        if scan_req.sizingMode == "vcpu_pool"
+                        else f"{scan_req.vmCount}x {scan_req.machineType}"
+                    )
                     for msg_data in [
-                        {"type": "info", "message": f"Configuration validated: {scan_req.vmCount}x {scan_req.machineType}"},
+                        {"type": "info", "message": f"Configuration validated: {target_desc}"},
                         {"type": "info", "message": f"Methods: {methods_str} | Zones: {zones_str}"},
                         {"type": "demo_notice", "message": "Demo Mode — Deployment Disabled", "details": {
-                            "description": "This is a hosted demo. GPU/TPU deployment is disabled. To run with full features:",
+                            "description": "This is a hosted demo. GPU/TPU/CPU deployment is disabled. To run with full features:",
                             "steps": [
                                 "git clone https://github.com/MG-Cafe/capacity_radar.git && cd capacity_radar",
                                 "gcloud auth application-default login",

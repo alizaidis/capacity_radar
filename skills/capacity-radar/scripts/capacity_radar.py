@@ -245,6 +245,17 @@ def cmd_advise(args):
                 size=args.size, max_run_duration_hours=args.max_run_hours,
                 regions=regions, zones=zones,
             )
+        if args.kind == "cpu-pool":
+            return await advisory.get_cpu_pool_advisory(
+                project=args.project,
+                cpu_family=args.cpu_family,
+                target_vcpus=args.target_vcpus,
+                placement_scope=args.scope,
+                min_cluster_vcpus=args.min_cluster_vcpus,
+                shape_class=args.shape_class,
+                regions=regions,
+                zones=zones,
+            )
         raise ValueError(f"Unknown advisory kind: {args.kind}")
 
     try:
@@ -291,6 +302,15 @@ def _parse_priority(spec: str) -> dict:
 def cmd_deploy(args):
     import hunter
     from gpu_data import get_zones_for_machine_type, get_calendar_zones_for_machine_type
+    from cpu_data import get_cpu_zones_for_series, normalize_cpu_series
+
+    is_pool = bool(args.cpu_family)
+    if not is_pool and not args.machine_type:
+        _err("Pass either --machine-type <SHAPE> (exact shape) or --cpu-family <SERIES> --target-vcpus <N> (CPU pool).")
+    if is_pool and not normalize_cpu_series(args.cpu_family):
+        _err(f"Unknown CPU series '{args.cpu_family}'. Run `catalog chips` to list supported CPU series.")
+
+    target_regions = [r.strip() for r in (args.regions or "").split(",") if r.strip()]
 
     valid_methods = {"on_demand", "dws_calendar", "dws_flex", "spot"}
     priorities = []
@@ -299,8 +319,10 @@ def cmd_deploy(args):
         if p["method"] not in valid_methods:
             _err(f"Invalid method '{p['method']}'. Valid: {sorted(valid_methods)}")
         if not p["zones"]:
-            # Default to calendar zones for dws_calendar if defined, else all supported zones.
-            if p["method"] == "dws_calendar":
+            if is_pool:
+                all_z = get_cpu_zones_for_series(args.cpu_family)
+                p["zones"] = [z for z in all_z if not target_regions or z.rsplit("-", 1)[0] in target_regions]
+            elif p["method"] == "dws_calendar":
                 p["zones"] = get_calendar_zones_for_machine_type(args.machine_type) or get_zones_for_machine_type(args.machine_type)
             else:
                 p["zones"] = get_zones_for_machine_type(args.machine_type)
@@ -324,19 +346,36 @@ def cmd_deploy(args):
         _err("At least one --priority is required (e.g. --priority spot:us-central1-b).")
 
     if not args.yes:
+        plan_obj = {
+            "project": args.project,
+            "sizingMode": "vcpu_pool" if is_pool else "exact_shape",
+            "mode": "parallel" if args.parallel else "sequential",
+            "priorities": [
+                {"method": p["method"], "zonesCount": len(p["zones"]), "sampleZones": p["zones"][:5]} for p in priorities
+            ],
+        }
+        if is_pool:
+            plan_obj.update({
+                "cpuFamily": normalize_cpu_series(args.cpu_family),
+                "targetVcpus": args.target_vcpus,
+                "minTotalVcpus": args.min_total_vcpus or args.target_vcpus,
+                "placementScope": args.scope,
+                "minClusterVcpus": args.min_cluster_vcpus,
+                "shapeClass": args.shape_class,
+                "targetRegions": target_regions,
+            })
+        else:
+            plan_obj.update({
+                "machineType": args.machine_type,
+                "vmCount": args.vm_count,
+                "minVmCount": args.min_vm_count or args.vm_count,
+                "maxVmCount": args.max_vm_count or args.vm_count,
+            })
         _err(
             "Refusing to deploy without confirmation. This creates REAL GCP resources "
             "that cost money. Re-run with --yes once the user has explicitly confirmed.",
             requiresConfirmation=True,
-            plan={
-                "project": args.project,
-                "machineType": args.machine_type,
-                "vmCount": args.vm_count,
-                "mode": "parallel" if args.parallel else "sequential",
-                "priorities": [
-                    {"method": p["method"], "zones": p["zones"]} for p in priorities
-                ],
-            },
+            plan=plan_obj,
         )
 
     events = []
@@ -350,13 +389,24 @@ def cmd_deploy(args):
     async def run():
         session = hunter.create_session(
             project=args.project,
-            machine_type=args.machine_type,
-            vm_count=args.vm_count,
+            machine_type=args.machine_type or "",
+            vm_count=args.max_vm_count or args.vm_count,
+            min_vm_count=args.min_vm_count or args.vm_count,
+            max_vm_count=args.max_vm_count or args.vm_count,
+            total_hunting_hours=args.hunting_hours,
             priorities=priorities,
             send_update=send_update,
             dws_calendar_duration_hours=args.calendar_duration_hours,
             network=network,
             subnetwork=subnetwork,
+            sizing_mode="vcpu_pool" if is_pool else "exact_shape",
+            cpu_family=args.cpu_family or "",
+            target_vcpus=args.target_vcpus,
+            min_total_vcpus=args.min_total_vcpus,
+            placement_scope=args.scope,
+            min_cluster_vcpus=args.min_cluster_vcpus,
+            shape_class=args.shape_class,
+            target_regions=target_regions,
         )
 
         await session.run(parallel=args.parallel)
@@ -443,11 +493,35 @@ def build_parser():
     s_flex.add_argument("--size", type=int, default=1, help="Number of instances")
     s_flex.add_argument("--max-run-hours", type=int, default=24, help="Max run duration (<=168)")
 
+    s_cpupool = adv_sub.add_parser("cpu-pool", help="Plan a broad CPU vCPU pool across single/multi-region scopes")
+    s_cpupool.add_argument("--project", required=True)
+    s_cpupool.add_argument("--cpu-family", required=True, help="CPU series, e.g. C4A, C4, C4D, C3, N4")
+    s_cpupool.add_argument("--target-vcpus", type=int, default=500)
+    s_cpupool.add_argument("--scope", choices=["multi_region", "single_region", "single_zone"], default="multi_region")
+    s_cpupool.add_argument("--min-cluster-vcpus", type=int, default=30)
+    s_cpupool.add_argument("--shape-class", choices=["any", "standard", "highcpu", "highmem"], default="any")
+    s_cpupool.add_argument("--regions", default="", help="Optional comma-separated regions filter")
+    s_cpupool.add_argument("--zones", default="", help="Optional comma-separated zones filter")
+    s_cpupool.set_defaults(func=cmd_advise)
+
     # deploy
     dep = sub.add_parser("deploy", help="Priority-based scan & deploy (creates REAL resources)")
     dep.add_argument("--project", required=True)
-    dep.add_argument("--machine-type", required=True)
+    dep.add_argument("--machine-type", default="", help="Exact GPU/TPU/CPU machine type (e.g. a3-highgpu-8g, c4a-highcpu-64)")
     dep.add_argument("--vm-count", type=int, default=1)
+    dep.add_argument("--min-vm-count", type=int, default=None)
+    dep.add_argument("--max-vm-count", type=int, default=None)
+    dep.add_argument("--hunting-hours", type=float, default=1.0)
+    dep.add_argument("--cpu-family", default="", help="Broad CPU vCPU Pool series (e.g. C4A, C4, C4D)")
+    dep.add_argument("--target-vcpus", type=int, default=500, help="Target total vCPUs when --cpu-family is set")
+    dep.add_argument("--min-total-vcpus", type=int, default=None, help="Minimum acceptable total vCPUs")
+    dep.add_argument("--scope", choices=["multi_region", "single_region", "single_zone"], default="multi_region",
+                     help="Placement scope for CPU vCPU Pool")
+    dep.add_argument("--min-cluster-vcpus", type=int, default=30,
+                     help="Minimum local cluster size in vCPUs per zone (default: 30)")
+    dep.add_argument("--shape-class", choices=["any", "standard", "highcpu", "highmem"], default="any",
+                     help="Shape family preference for CPU vCPU Pool")
+    dep.add_argument("--regions", default="", help="Optional comma-separated region filter for CPU Pool")
     dep.add_argument(
         "--priority", action="append", default=[],
         help="Repeatable. Format: method[:zones][:max_retries][:retry_interval]. "

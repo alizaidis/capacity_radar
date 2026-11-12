@@ -1,12 +1,13 @@
 ---
 name: capacity-radar
 description: >-
-  Find, advise on, and deploy Google Cloud GPU/TPU capacity from chat. Use this
-  skill whenever the user wants to check GPU/TPU availability, get capacity
+  Find, advise on, and deploy Google Cloud GPU, TPU, and CPU capacity from chat. Use this
+  skill whenever the user wants to check GPU/TPU/CPU availability, get capacity
   advice, compare consumption models (On-Demand, DWS Calendar, DWS Flex Start,
-  Spot), or actually deploy/reserve/hunt for GPU or TPU capacity on Google Cloud
-  (GCP). Triggers include: "find me H100s", "check spot availability", "reserve
-  a3-highgpu-8g", "how long to wait for DWS Flex", "hunt for GPUs", "get me TPUs".
+  Spot), hunt exact VM shapes (e.g. c4a-highcpu-64), or grab broad CPU vCPU pools
+  (e.g. 500 C4A vCPUs anywhere, single-region, or multi-region with min local cluster size).
+  Triggers include: "find me H100s", "grab 500 C4a vCPUs", "reserve c4a-highcpu-64",
+  "check spot availability", "how long to wait for DWS Flex", "hunt for GPUs/TPUs/CPUs".
 license: Not an official Google product. Use at your own risk.
 ---
 
@@ -64,7 +65,9 @@ python scripts/capacity_radar.py <group> <command> [flags...]
 | `advise calendar --project <ID> --machine-type <MT> --vm-count N --start-date YYYY-MM-DD --flexibility-days 0..3 --duration-days D [--regions/--zones]` | DWS Calendar availability |
 | `advise calendar-plan ... (same flags as calendar)` | DWS Calendar "best split" plan |
 | `advise flex --project <ID> --machine-type <MT> --size N --max-run-hours H [--regions/--zones]` | DWS Flex Start wait-time advisory (Preview) |
-| `deploy --project <ID> --machine-type <MT> --vm-count N --priority <spec> [--priority ...] [--parallel] [--yes]` | Priority-based scan & deploy (REAL resources) |
+| `advise cpu-pool --project <ID> --cpu-family C4A --target-vcpus 500 --scope multi_region --min-cluster-vcpus 30` | Plan a broad CPU vCPU pool across single-zone, single-region, or multi-region scopes |
+| `deploy --project <ID> --machine-type <MT> --vm-count N --priority <spec> [--priority ...] [--parallel] [--yes]` | Priority-based exact-shape scan & deploy (GPU, TPU, or CPU) |
+| `deploy --project <ID> --cpu-family C4A --target-vcpus 500 --scope multi_region --min-cluster-vcpus 30 --priority spot --priority on_demand [--yes]` | Broad CPU vCPU Pool scan & deploy across regions/zones |
 
 ### `--priority` spec format (deploy)
 
